@@ -13,6 +13,8 @@ export interface TaxOfflineSettings {
 }
 
 export const API_MAX_OFFLINE_SESSION_DURATION_MINUTES = 36 * 60;
+// Total of all offline sessions in a calendar month.
+export const API_MAX_OFFLINE_MONTHLY_DURATION_MINUTES = 168 * 60;
 export const API_MAX_OFFLINE_PACKAGE_DOCUMENTS = 100;
 
 export const DEFAULT_TAX_OFFLINE_SETTINGS: TaxOfflineSettings = {

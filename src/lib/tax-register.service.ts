@@ -1,4 +1,22 @@
-import { sha256 } from 'js-sha256';
+import {
+  formatOrderDate,
+  formatOrderTime,
+  parseOrderDateTime,
+} from './documents/document-date.js';
+import { hashTaxDocument } from './documents/document-hash.js';
+import { createDocumentHead } from './documents/document-head.js';
+import {
+  createOfflineFiscalNumber,
+  getOfflineControlNumber,
+  getOfflineControlString,
+} from './documents/offline-fiscal-number.js';
+import { TaxDocumentUtility } from './documents/tax-document.utility.js';
+import {
+  TaxTicket,
+  getTaxTicketError,
+  parseTaxTicket,
+  setDocumentFiscalNumber,
+} from './documents/tax-ticket.js';
 import {
   TaxOfflineSettings,
   normalizeTaxOfflineSettings,
@@ -11,19 +29,21 @@ import {
   ShiftTotalsOrderType,
   TaxDocumentSubType,
   TaxDocumentType,
+  TaxRegisterConfig,
   TransactionsRegistrarStateResponse,
   isOfflineSequenceActive,
 } from './models/tax.model.js';
+import { validateOfflineSessionStart } from './offline/offline-session-start.js';
 import { TaxContextStorage } from './storage/tax-context-storage.js';
-import { TaxContextEventEmitter } from './utils/event-emitter.js';
-import { encodeWin1251 } from './utils/win1251.js';
 import { parseXml } from './utils/xml-parser.js';
 
 const TAX_REGISTER_CONTEXT_KEY_PREFIX = 'TAX_REGISTER_CONTEXT__';
 const TAX_REGISTER_DOCUMENTS_KEY_PREFIX = 'TAX_REGISTER_DOCUMENTS__';
-const TAX_REGISTER_STORE_KEY_PREFIX = 'TAX_REGISTER_STORE__';
 const TAX_DOCUMENT_STAGE_KEY_PREFIX = 'TAX_DOCUMENT_STAGE__';
 const OFFLINE_PACKAGE_CHUNK_SIZE = 50;
+// Fiscal numbers are identifiers, read as written: as numbers they would lose leading zeros
+// and, above 2^53, digits.
+const FISCAL_NUMBER_ELEMENTS = ['ORDERTAXNUM', 'ORDERSTORNUM'];
 
 export type TaxRegisterContextId = string | number;
 
@@ -42,26 +62,30 @@ export interface OfflineSessionState {
   OfflineSeed: string | number;
 }
 
-export interface TaxOfflineSessionError {
-  message: string;
-  occurredAt: string;
-  operation?: string;
-}
-
-export interface TaxRegisterContext {
-  storeId: number;
-  taxConfig: ITaxConfig;
+export interface TaxRegisterContext<
+  TConfig extends TaxRegisterConfig = ITaxConfig,
+> {
+  taxConfig: TConfig;
   registerState: TransactionsRegistrarStateResponse;
   lastShiftTotals: LastShiftTotalsResponse;
   serverState: StoredTaxServerState;
   disabled?: boolean;
-  offlineSessionErrors?: TaxOfflineSessionError[];
 }
 
 export interface TaxRegisterState
   extends TransactionsRegistrarStateResponse {
   OfflineSession: boolean;
   Offline: boolean;
+}
+
+// A document in the local journal: the document and what its registration put in force.
+// Entries saved before these fields existed simply lack them.
+export interface TaxJournalDocument extends DocumentItem {
+  // The server's receipt for a document registered online.
+  ticketXml?: string;
+  // The offline credentials this document put in force: from the receipt of an online shift
+  // opening, or from the end-session response saved with OfflineEnd.
+  offlineCredentials?: OfflineSessionState;
 }
 
 export interface TaxRegisterContextSettings extends TaxOfflineSettings {
@@ -77,6 +101,13 @@ export type TaxRegisterContextSettingsSource =
 
 interface TaxDocumentHead {
   UID?: string;
+  TIN?: number | string;
+  IPN?: number | string;
+  ORGNM?: string;
+  POINTNM?: string;
+  POINTADDR?: string;
+  CASHDESKNUM?: number | string;
+  CASHREGISTERNUM?: number | string;
   ORDERNUM: number | string;
   ORDERTAXNUM?: number | string;
   DOCTYPE?: number | string;
@@ -85,6 +116,7 @@ interface TaxDocumentHead {
   ORDERTIME?: number | string;
   REVOKED?: boolean | string;
   REVOKELASTONLINEDOC?: boolean | string;
+  ORDERSTORNUM?: number | string;
   CASHIER?: string;
   TESTING?: boolean | string;
   OFFLINE?: boolean | string;
@@ -110,10 +142,13 @@ interface ParsedTaxDocument {
 // Local state of tax registers: the context received from the server, the journal of
 // documents created since, and the state and shift totals derived from both. Create one
 // instance per storage and keep it for the application's lifetime: it caches contexts.
-export class TaxRegisterService {
-  // Emits the tax register fiscal number whenever its state changes.
-  stateChanged = new TaxContextEventEmitter<string>();
-  private _contexts = new Map<string, TaxRegisterContext>();
+//
+// Registers are identified by fiscal number only. TConfig is the application's register
+// configuration; the service reads its fiscal number and otherwise stores and returns it
+// unchanged, so links to the application's own entities (stores, points of sale) stay in
+// the application.
+export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> {
+  private _contexts = new Map<string, TaxRegisterContext<TConfig>>();
 
   constructor(
     private _storage: TaxContextStorage,
@@ -134,15 +169,19 @@ export class TaxRegisterService {
     return settings || {};
   }
 
+  // Replaces the snapshot with the server's data and clears the journal. Returns false and
+  // updates only the server time when that would lose documents:
+  // - the journal holds a document the server does not have: its last document is numbered at
+  //   or after the state's NextLocalNum; force does not skip this check;
+  // - without force, the stored snapshot has an active offline sequence.
   async initContext(
-    taxConfig: ITaxConfig,
+    taxConfig: TConfig,
     registerState: TransactionsRegistrarStateResponse,
     lastShiftTotals: LastShiftTotalsResponse | null,
     serverState: TaxServerState,
     force = false,
   ): Promise<boolean> {
     const id = this._getTaxRegisterId(taxConfig);
-    const storeId = this._getStoreId(taxConfig);
 
     if (!registerState) {
       throw new Error('Tax register state is required.');
@@ -167,24 +206,35 @@ export class TaxRegisterService {
       }
     }
 
-    const context: TaxRegisterContext = {
-      storeId,
+    const documents = await this._getDocuments(id);
+    if (this._hasDocumentsMissingOnServer(documents, registerState)) {
+      return false;
+    }
+
+    const registrationCancelled = this._toBoolean(
+      registerState.Closed as boolean | string,
+    );
+    const context: TaxRegisterContext<TConfig> = {
       taxConfig,
       registerState,
       lastShiftTotals:
         lastShiftTotals || this._createEmptyLastShiftTotals(registerState),
       serverState: storedServerState,
-      disabled: currentContext ? currentContext.disabled : true,
+      // A new context starts disabled; an existing one keeps the application's setting unless
+      // the registration is cancelled.
+      disabled: registrationCancelled
+        ? true
+        : currentContext
+          ? currentContext.disabled
+          : true,
     };
 
     await this._saveContext(id, context);
-    await this._storage.set(this._getStoreStorageKey(storeId), id);
     await this._saveDocuments(id, []);
-    this.stateChanged.emit(id);
     return true;
   }
 
-  async saveTaxConfig(taxConfig: ITaxConfig): Promise<void> {
+  async saveTaxConfig(taxConfig: TConfig): Promise<void> {
     const id = this._getTaxRegisterId(taxConfig);
     const context = await this._getContext(id);
     if (!context) {
@@ -196,86 +246,25 @@ export class TaxRegisterService {
     await this._saveContext(id, { ...context, taxConfig });
   }
 
-  async updateServerState(
-    taxRegisterId: TaxRegisterContextId,
-    state: TransactionsRegistrarStateResponse,
-  ): Promise<void> {
-    const id = this._normalizeTaxRegisterId(taxRegisterId);
-    const context = await this._getContext(id);
-    if (!context) {
-      throw new Error(
-        `Tax register context not found. TaxRegister fiscal number ${id}`,
-      );
-    }
-    if (!state) {
-      throw new Error('Tax register state is required.');
-    }
-
-    const nextLocalNum = Number(state.NextLocalNum);
-    if (!Number.isInteger(nextLocalNum) || nextLocalNum < 0) {
-      throw new Error('Tax register state NextLocalNum is invalid.');
-    }
-
-    await this._saveContext(id, {
-      ...context,
-      registerState: state,
-    });
-
-    const documents = await this._getDocuments(id);
-    await this._saveDocuments(
-      id,
-      documents.filter((document) => Number(document.NumLocal) >= nextLocalNum),
-    );
-  }
-
-  async finishOfflineSession(
-    taxRegisterId: TaxRegisterContextId,
-    offlineSessionState: OfflineSessionState,
-  ): Promise<void> {
-    await this.setOfflineCredentials(taxRegisterId, offlineSessionState);
-  }
-
-  // Replaces the offline credentials in force: from an online shift-opening receipt or an
-  // end-session response. The session ID and seed always change together.
-  async setOfflineCredentials(
-    taxRegisterId: TaxRegisterContextId,
-    offlineSessionState: OfflineSessionState,
-  ): Promise<void> {
-    const id = this._normalizeTaxRegisterId(taxRegisterId);
-    const context = await this._getContext(id);
-    if (!context) {
-      throw new Error(
-        `Tax register context not found. TaxRegister fiscal number ${id}`,
-      );
-    }
-    this._assertOfflineSessionState(offlineSessionState);
-
-    await this._saveContext(id, {
-      ...context,
-      registerState: {
-        ...context.registerState,
-        OfflineSessionId: offlineSessionState.OfflineSessionId.toString(),
-        OfflineSeed: offlineSessionState.OfflineSeed.toString(),
-        OfflineNextLocalNum: '1',
-      },
-    });
-    this.stateChanged.emit(id);
-  }
-
-  // Saves the accepted end-session document and the next session's credentials. Called only
-  // after a successful end-package response; the journal is written first, so an interrupted
-  // call leaves a closed session that the next full sync refreshes from the server.
+  // Saves the accepted end-session document together with the next session's credentials from
+  // the end-package response, in one journal write. Call it only after that response.
   async completeOfflineSession(
     taxRegisterId: TaxRegisterContextId,
     endSessionXml: string,
-    offlineSessionState: OfflineSessionState,
+    nextSession: OfflineSessionState,
   ): Promise<void> {
-    this._assertOfflineSessionState(offlineSessionState);
-    await this.saveDocument(taxRegisterId, endSessionXml);
-    await this.setOfflineCredentials(taxRegisterId, offlineSessionState);
+    this._assertOfflineSessionState(nextSession);
+    const document = this._parseDocument(endSessionXml);
+    if (document.CheckDocType !== 'OfflineEnd') {
+      throw new Error('Tax document is not an offline session end.');
+    }
+
+    const id = this._normalizeTaxRegisterId(taxRegisterId);
+    const offlineCredentials = this._toOfflineCredentials(nextSession);
+    await this._appendDocuments(id, [{ xml: endSessionXml, offlineCredentials }]);
   }
 
-  async getTaxConfig(taxRegisterId: TaxRegisterContextId): Promise<ITaxConfig> {
+  async getTaxConfig(taxRegisterId: TaxRegisterContextId): Promise<TConfig> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     const context = await this._getContext(id);
     if (!context) {
@@ -305,49 +294,9 @@ export class TaxRegisterService {
     return new Date(Date.now() + serverResponseTime - storedCurrentTime);
   }
 
-  async getTaxRegisterIdByStoreId(
-    storeId: number,
-  ): Promise<string | null> {
-    const normalizedStoreId = this._normalizeStoreId(storeId);
-    const taxRegisterId = await this._storage.get<TaxRegisterContextId>(
-      this._getStoreStorageKey(normalizedStoreId),
-    );
-    if (!taxRegisterId) {
-      return null;
-    }
-
-    return this._normalizeTaxRegisterId(taxRegisterId);
-  }
-
-  async getTaxRegisterByStoreId(
-    storeId: number,
-  ): Promise<ITaxConfig['taxRegister'] | null> {
-    const taxRegisterId = await this.getTaxRegisterIdByStoreId(storeId);
-    if (!taxRegisterId) {
-      return null;
-    }
-
-    const context = await this._getContext(taxRegisterId);
-    return context?.taxConfig?.taxRegister || null;
-  }
-
-  async getTaxContextByStoreId(
-    storeId: number,
-  ): Promise<TaxRegisterContext | null> {
-    const normalizedStoreId = this._normalizeStoreId(storeId);
-    const taxRegisterId = await this._storage.get<TaxRegisterContextId>(
-      this._getStoreStorageKey(normalizedStoreId),
-    );
-    if (!taxRegisterId) {
-      return null;
-    }
-
-    return await this._getContext(taxRegisterId);
-  }
-
   async getTaxContext(
     taxRegisterId: TaxRegisterContextId,
-  ): Promise<TaxRegisterContext | null> {
+  ): Promise<TaxRegisterContext<TConfig> | null> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     return await this._getContext(id);
   }
@@ -377,6 +326,8 @@ export class TaxRegisterService {
     if (!documents.length) {
       return state;
     }
+
+    this._applyOfflineCredentials(state, documents);
 
     const lastDocument = documents[documents.length - 1];
     const parsedDocument = parseXml<ParsedTaxDocument>(lastDocument.xmlCheck);
@@ -454,11 +405,13 @@ export class TaxRegisterService {
     return !!(await this._getContext(taxRegisterId));
   }
 
+  // Disabled by the application, or because the register's registration is cancelled.
   async isDisabled(taxRegisterId: TaxRegisterContextId): Promise<boolean> {
     const context = await this._getContext(taxRegisterId);
-    return !!context?.disabled;
+    return !!context?.disabled || this._isRegistrationCancelled(context);
   }
 
+  // A register whose registration is cancelled cannot be enabled.
   async setDisabled(
     taxRegisterId: TaxRegisterContextId,
     disabled: boolean,
@@ -470,9 +423,11 @@ export class TaxRegisterService {
         `Tax register context not found. TaxRegister fiscal number ${id}`,
       );
     }
+    if (!disabled && this._isRegistrationCancelled(context)) {
+      throw new Error('Реєстрацію ПРРО скасовано: касу не можна увімкнути.');
+    }
 
     await this._saveContext(id, { ...context, disabled });
-    this.stateChanged.emit(id);
   }
 
   async removeContext(taxRegisterId: TaxRegisterContextId): Promise<void> {
@@ -481,30 +436,21 @@ export class TaxRegisterService {
       return;
     }
 
-    const context = await this._getContext(id);
     await this._storage.remove(this._getStorageKey(id));
     await this._storage.remove(this._getDocumentsStorageKey(id));
-    if (context?.storeId != null) {
-      const storeKey = this._getStoreStorageKey(context.storeId);
-      const mappedId = await this._storage.get<TaxRegisterContextId>(storeKey);
-      if (this._normalizeTaxRegisterId(mappedId) === id) {
-        await this._storage.remove(storeKey);
-      }
-    }
 
     this._contexts.delete(id);
-    this.stateChanged.emit(id);
   }
 
-  async getAllTaxConfigs(): Promise<ITaxConfig[]> {
+  async getAllTaxConfigs(): Promise<TConfig[]> {
     const storageKeys =
-      (await this._storage.keys().catch(() => [])) || [];
+      (await this._storage.keys().catch(() => [] as string[])) || [];
     const fiscalNumbers = storageKeys
       .filter((key) => key?.startsWith(TAX_REGISTER_CONTEXT_KEY_PREFIX))
       .map((key) => key.slice(TAX_REGISTER_CONTEXT_KEY_PREFIX.length))
       .filter((id) => !!id);
 
-    const configs: ITaxConfig[] = [];
+    const configs: TConfig[] = [];
     const seen = new Set<string>();
     for (const fiscalNumber of fiscalNumbers) {
       if (seen.has(fiscalNumber)) {
@@ -512,7 +458,11 @@ export class TaxRegisterService {
       }
       seen.add(fiscalNumber);
       const context = await this._getContext(fiscalNumber);
-      if (context?.taxConfig && !context.disabled) {
+      if (
+        context?.taxConfig &&
+        !context.disabled &&
+        !this._isRegistrationCancelled(context)
+      ) {
         configs.push(context.taxConfig);
       }
     }
@@ -520,79 +470,261 @@ export class TaxRegisterService {
     return configs;
   }
 
-  async getOfflineSessionErrors(
-    taxRegisterId: TaxRegisterContextId,
-  ): Promise<TaxOfflineSessionError[]> {
-    const context = await this._getContext(taxRegisterId);
-    return [...(context?.offlineSessionErrors || [])];
-  }
-
-  async saveOfflineSessionError(
-    taxRegisterId: TaxRegisterContextId,
-    error: unknown,
-    operation?: string,
-  ): Promise<void> {
-    const id = this._normalizeTaxRegisterId(taxRegisterId);
-    const context = await this._getContext(id);
-    if (!context) {
-      return;
-    }
-
-    const nextError: TaxOfflineSessionError = {
-      message: this._stringifyError(error),
-      occurredAt: new Date().toISOString(),
-      operation,
-    };
-    await this._saveContext(id, {
-      ...context,
-      offlineSessionErrors: [
-        ...(context.offlineSessionErrors || []),
-        nextError,
-      ].slice(-20),
-    });
-    this.stateChanged.emit(id);
-  }
-
+  // Saves a document at the next local number and returns its XML as saved.
+  //
+  // For a document registered online, pass the server's receipt as received (its XML, see
+  // extractTicketXml); the service parses it. It must belong to the document (same UID and
+  // ORDERNUM). In the same journal write:
+  // - the receipt's fiscal number (ORDERTAXNUM) is written into the document, replacing a value
+  //   already there;
+  // - the receipt is kept with the document;
+  // - the receipt of a shift opening puts its offline credentials in force. A receipt without
+  //   both credentials leaves the credentials in force unchanged.
+  // The receipt is a generic structure: its ERRORCODE is ignored when it carries the fiscal
+  // number. Without one, a non-zero ERRORCODE is the server's rejection: nothing is saved and
+  // the error is thrown in the server's error format.
   async saveDocument(
     taxRegisterId: TaxRegisterContextId,
     rawXml: string,
-  ): Promise<void> {
+    ticketXml?: string | null,
+  ): Promise<string> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
-    const document = this._parseDocument(rawXml);
-    const parsedDocument = parseXml<ParsedTaxDocument>(rawXml);
-    const head =
-      parsedDocument?.CHECK?.CHECKHEAD || parsedDocument?.ZREP?.ZREPHEAD;
-    const context = await this._getContext(id);
-    if (!context) {
-      throw new Error(
-        `Tax register context not found. TaxRegister fiscal number ${id}`,
-      );
+    if (!ticketXml) {
+      await this._appendDocuments(id, [{ xml: rawXml }]);
+      return rawXml;
     }
 
-    const documents = await this._getDocuments(id);
-    const expectedLocalNumber = this._getCurrentNextOrderNumber(
-      context,
-      documents,
-    );
-    if (document.NumLocal !== expectedLocalNumber) {
-      throw new Error(
-        `Tax document local number ${document.NumLocal} is invalid. Expected ${expectedLocalNumber}.`,
-      );
+    const receipt = parseTaxTicket(ticketXml);
+    if (!receipt) {
+      throw new Error('Квитанція сервера не містить даних.');
     }
-    if (parsedDocument.CHECK) {
-      // await this.validateNextDocument(id, head?.DOCTYPE, head?.DOCSUBTYPE);
+    const head = this._getDocumentHead(rawXml);
+    // Offline documents are sent in packages and have no receipt of their own; their fiscal
+    // number is the locally generated one.
+    if (this._toBoolean(head.OFFLINE)) {
+      throw new Error('Офлайн документ не має квитанції сервера.');
     }
-    await this._stageDocument(id, rawXml);
-    await this._saveDocuments(id, [...documents, document]);
+    this._assertTicketMatches(receipt, head);
+
+    const rejection = getTaxTicketError(receipt);
+    if (rejection) {
+      throw new Error(rejection);
+    }
+
+    const xml = setDocumentFiscalNumber(rawXml, receipt.ORDERTAXNUM);
+    const offlineCredentials =
+      Number(head.DOCTYPE) === TaxDocumentType.OPEN_SHIFT &&
+      this._hasValue(receipt.OFFLINESESSIONID) &&
+      this._hasValue(receipt.OFFLINESEED)
+        ? this._toOfflineCredentials({
+            OfflineSessionId: receipt.OFFLINESESSIONID,
+            OfflineSeed: receipt.OFFLINESEED,
+          })
+        : undefined;
+
+    await this._appendDocuments(id, [{ xml, ticketXml, offlineCredentials }]);
+    return xml;
   }
 
-  // Appends consecutive documents in one journal write, so that a partially saved group
-  // (for example OfflineBegin without its recreated document) is never stored.
-  async saveDocuments(
+  // Continues a document offline after its online attempt failed. originalXml is that document,
+  // unsaved, at the next local number. One journal write stores:
+  // - the original, marked as revoked (REVOKED): the totals and the systems that receive the
+  //   documents ignore it, and if the server registered it, the upload revokes it there;
+  // - OfflineBegin with the original's issuer data and UID, offline number 1;
+  // - the original converted to an offline document, offline number 2: in its header only the
+  //   local number, the time, the offline fiscal number and OFFLINE change; its body stays
+  //   byte-identical.
+  // Offline readiness is checked before anything is saved. Returns the offline copy's XML.
+  async startOfflineSession(
     taxRegisterId: TaxRegisterContextId,
-    rawXmls: string[],
-  ): Promise<void> {
+    originalXml: string,
+  ): Promise<string> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
+    await this.validateNextDocument(id, TaxDocumentType.OOFFLINE_BEGIN);
+    const state = await this.getState(id);
+    validateOfflineSessionStart(state);
+
+    if (!originalXml?.trim().startsWith('<')) {
+      throw new Error('Tax document must be raw XML.');
+    }
+    const head = this._getDocumentHead(originalXml, true);
+    const docType = Number(head.DOCTYPE);
+    if (
+      this._toBoolean(head.OFFLINE) ||
+      docType === TaxDocumentType.OOFFLINE_BEGIN ||
+      docType === TaxDocumentType.OFFLINE_END
+    ) {
+      throw new Error(
+        'Офлайн сесію починає лише документ, який надсилали онлайн.',
+      );
+    }
+
+    const now = await this._getDocumentClock(id);
+    const orderDate = formatOrderDate(now);
+    const orderTime = formatOrderTime(now);
+    const originalNumLocal = Number(head.ORDERNUM);
+    const offlineBeginXml = TaxDocumentUtility.getChekDoc(
+      createDocumentHead({
+        docType: TaxDocumentType.OOFFLINE_BEGIN,
+        uid: this._text(head.UID),
+        orderDate,
+        orderTime,
+        orderNumber: originalNumLocal + 1,
+        issuer: {
+          tin: this._text(head.TIN),
+          ipn: this._text(head.IPN) || undefined,
+          organizationName: this._text(head.ORGNM),
+          pointName: this._text(head.POINTNM),
+          pointAddress: this._text(head.POINTADDR),
+          cashRegisterNum: this._text(head.CASHREGISTERNUM),
+          cashDeskNum: Number(head.CASHDESKNUM),
+          cashier: this._text(head.CASHIER),
+        },
+        offline: {
+          sessionId: state.OfflineSessionId,
+          seed: state.OfflineSeed,
+          localNum: 1,
+        },
+      }),
+    );
+
+    const copyNumLocal = originalNumLocal + 2;
+    const copyFiscalNumber = createOfflineFiscalNumber(
+      state.OfflineSessionId,
+      2,
+      getOfflineControlNumber(
+        getOfflineControlString({
+          seed: state.OfflineSeed,
+          orderDate,
+          orderTime,
+          orderNumber: copyNumLocal,
+          cashRegisterNum: this._text(head.CASHREGISTERNUM),
+          cashDeskNum: this._text(head.CASHDESKNUM),
+          checkTotal: this._getCheckTotal(originalXml),
+        }),
+      ),
+    );
+    const offlineCopyXml = this._toOfflineCopy(originalXml, {
+      orderDate,
+      orderTime,
+      orderNumber: copyNumLocal,
+      fiscalNumber: copyFiscalNumber,
+    });
+
+    await this._appendDocuments(id, [
+      { xml: this._markRevoked(originalXml) },
+      { xml: offlineBeginXml },
+      { xml: offlineCopyXml },
+    ]);
+    return offlineCopyXml;
+  }
+
+  // The original as an offline document. In the header, ORDERDATE, ORDERTIME and ORDERNUM get
+  // the new values and the offline ORDERTAXNUM and OFFLINE go after VER, their schema position;
+  // elements of a registered or revoked document are dropped. The body is not touched.
+  private _toOfflineCopy(
+    xml: string,
+    values: {
+      orderDate: string;
+      orderTime: string;
+      orderNumber: number;
+      fiscalNumber: string;
+    },
+  ): string {
+    const headEnd = Math.max(
+      xml.indexOf('</CHECKHEAD>'),
+      xml.indexOf('</ZREPHEAD>'),
+    );
+    if (headEnd < 0) {
+      throw new Error('Tax document CHECKHEAD or ZREPHEAD is missing.');
+    }
+
+    let head = xml.slice(0, headEnd);
+    head = this._setElement(head, 'ORDERDATE', values.orderDate);
+    head = this._setElement(head, 'ORDERTIME', values.orderTime);
+    head = this._setElement(head, 'ORDERNUM', String(values.orderNumber));
+    for (const name of ['ORDERTAXNUM', 'OFFLINE', 'PREVDOCHASH', 'REVOKED']) {
+      head = head.replace(new RegExp(`<${name}>[^<]*</${name}>\\s*`), '');
+    }
+
+    const ver = head.indexOf('</VER>');
+    if (ver < 0) {
+      throw new Error('Tax document VER is missing.');
+    }
+    const at = ver + '</VER>'.length;
+    const offlineElements =
+      `<ORDERTAXNUM>${values.fiscalNumber}</ORDERTAXNUM>` +
+      '<OFFLINE>true</OFFLINE>';
+    return `${head.slice(0, at)}${offlineElements}${head.slice(at)}${xml.slice(headEnd)}`;
+  }
+
+  private _setElement(xml: string, name: string, value: string): string {
+    const element = new RegExp(`<${name}>[^<]*</${name}>`);
+    if (!element.test(xml)) {
+      throw new Error(`Tax document ${name} is missing.`);
+    }
+    return xml.replace(element, () => `<${name}>${value}</${name}>`);
+  }
+
+  // CHECKTOTAL/SUM formatted 0.00 for the control number; null for documents without one.
+  private _getCheckTotal(xml: string): string | null {
+    const sum = parseXml<ParsedTaxDocument>(xml, { keepText: true }).CHECK
+      ?.CHECKTOTAL?.SUM;
+    if (!this._hasValue(sum)) {
+      return null;
+    }
+
+    const text = String(sum).trim();
+    if (/^-?\d+\.\d{2}$/.test(text)) {
+      return text;
+    }
+    const number = Number(text);
+    return Number.isFinite(number) ? number.toFixed(2) : null;
+  }
+
+  private _text(value: unknown): string {
+    return this._hasValue(value) ? String(value) : '';
+  }
+
+  // Sets <REVOKED>true</REVOKED> at its schema position: after VER, ORDERTAXNUM, OFFLINE and
+  // PREVDOCHASH, before STORNED and TESTING.
+  private _markRevoked(xml: string): string {
+    const element = '<REVOKED>true</REVOKED>';
+    const existing = /<REVOKED>[^<]*<\/REVOKED>/;
+    if (existing.test(xml)) {
+      return xml.replace(existing, () => element);
+    }
+
+    for (const previous of ['PREVDOCHASH', 'OFFLINE', 'ORDERTAXNUM', 'VER']) {
+      const closing = `</${previous}>`;
+      const at = xml.indexOf(closing);
+      if (at >= 0) {
+        const end = at + closing.length;
+        return `${xml.slice(0, end)}${element}${xml.slice(end)}`;
+      }
+    }
+    for (const next of ['<STORNED>', '<TESTING>', '</CHECKHEAD>', '</ZREPHEAD>']) {
+      const at = xml.indexOf(next);
+      if (at >= 0) {
+        return `${xml.slice(0, at)}${element}${xml.slice(at)}`;
+      }
+    }
+    return xml;
+  }
+
+  // Checks the numbering of new documents and saves them with one journal write; the queue of
+  // documents for other systems gets each XML as well.
+  private async _appendDocuments(
+    id: string,
+    entries: Array<{
+      xml: string;
+      ticketXml?: string;
+      offlineCredentials?: OfflineSessionState;
+    }>,
+  ): Promise<void> {
+    const newDocuments = entries.map((entry) =>
+      this._withJournalData(this._parseDocument(entry.xml), entry),
+    );
     const context = await this._getContext(id);
     if (!context) {
       throw new Error(
@@ -600,9 +732,6 @@ export class TaxRegisterService {
       );
     }
 
-    const newDocuments = (rawXmls || []).map((rawXml) =>
-      this._parseDocument(rawXml),
-    );
     const documents = await this._getDocuments(id);
     let expectedLocalNumber = this._getCurrentNextOrderNumber(
       context,
@@ -617,10 +746,76 @@ export class TaxRegisterService {
       expectedLocalNumber++;
     }
 
-    for (const rawXml of rawXmls) {
-      await this._stageDocument(id, rawXml);
+    for (const entry of entries) {
+      await this._stageDocument(id, entry.xml);
     }
     await this._saveDocuments(id, [...documents, ...newDocuments]);
+  }
+
+  // Adds the receipt and the credentials the document put in force; absent values are not
+  // written, so entries stay as they were for documents without them.
+  private _withJournalData(
+    document: DocumentItem,
+    data: { ticketXml?: string; offlineCredentials?: OfflineSessionState },
+  ): TaxJournalDocument {
+    const entry = document as TaxJournalDocument;
+    if (data.ticketXml) {
+      entry.ticketXml = data.ticketXml;
+    }
+    if (data.offlineCredentials) {
+      entry.offlineCredentials = data.offlineCredentials;
+    }
+    return entry;
+  }
+
+  // keepText: values as written, for copying them into another document.
+  private _getDocumentHead(rawXml: string, keepText = false): TaxDocumentHead {
+    const parsedDocument = parseXml<ParsedTaxDocument>(rawXml, { keepText });
+    const head =
+      parsedDocument?.CHECK?.CHECKHEAD || parsedDocument?.ZREP?.ZREPHEAD;
+    if (!head) {
+      throw new Error('Tax document CHECKHEAD or ZREPHEAD is missing.');
+    }
+    return head;
+  }
+
+  private _assertTicketMatches(ticket: TaxTicket, head: TaxDocumentHead): void {
+    const ticketUid = (ticket.UID || '').toString().trim().toLowerCase();
+    const documentUid = (head.UID || '').toString().trim().toLowerCase();
+    if (ticketUid && documentUid && ticketUid !== documentUid) {
+      throw new Error(
+        `Квитанція сервера належить іншому документу (UID ${ticket.UID}).`,
+      );
+    }
+    if (
+      this._hasValue(ticket.ORDERNUM) &&
+      Number(ticket.ORDERNUM) !== Number(head.ORDERNUM)
+    ) {
+      throw new Error(
+        `Квитанція сервера належить іншому документу (номер ${ticket.ORDERNUM}, очікується ${head.ORDERNUM}).`,
+      );
+    }
+  }
+
+  // The server state reports Closed for a register whose registration was cancelled while its
+  // shift is still open. The context is disabled while its stored state reports it.
+  private _isRegistrationCancelled(
+    context: TaxRegisterContext<TConfig> | null,
+  ): boolean {
+    return this._toBoolean(context?.registerState?.Closed as boolean | string);
+  }
+
+  private _toOfflineCredentials(
+    state: OfflineSessionState,
+  ): OfflineSessionState {
+    return {
+      OfflineSessionId: String(state.OfflineSessionId),
+      OfflineSeed: String(state.OfflineSeed),
+    };
+  }
+
+  private _hasValue(value: unknown): boolean {
+    return value !== null && value !== undefined && value !== '';
   }
 
   async getStagedDocumentBatch(
@@ -673,6 +868,11 @@ export class TaxRegisterService {
     docType?: number | string,
     docSubType?: number | string,
   ): Promise<void> {
+    // A cancelled registration disables the register for every document, Z-reports included.
+    if (this._isRegistrationCancelled(await this._getContext(taxRegisterId))) {
+      throw new Error('Реєстрацію ПРРО скасовано: нові документи не створюються.');
+    }
+
     // Z-reports do not have DOCTYPE or DOCSUBTYPE in ZREPHEAD.
     if (
       (docType === null || docType === undefined) &&
@@ -823,7 +1023,8 @@ export class TaxRegisterService {
     }
   }
 
-  // Document times use the server-time estimate when that correction is enabled.
+  // Document times use the server-time estimate when that correction is enabled; without a
+  // stored server time, the device clock.
   private async _getDocumentClock(
     taxRegisterId: TaxRegisterContextId,
   ): Promise<Date> {
@@ -835,7 +1036,7 @@ export class TaxRegisterService {
 
   async getDocuments(
     taxRegisterId: TaxRegisterContextId,
-  ): Promise<DocumentItem[]> {
+  ): Promise<TaxJournalDocument[]> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     const context = await this._getContext(id);
     if (!context) {
@@ -856,15 +1057,7 @@ export class TaxRegisterService {
       return null;
     }
 
-    return sha256(encodeWin1251(lastDocument.xmlCheck));
-  }
-
-  async hasOfflineDocs(taxRegisterId: TaxRegisterContextId): Promise<boolean> {
-    const documents = await this.getDocuments(taxRegisterId);
-    return documents.some(
-      (document) =>
-        this._getOfflineNextLocalNumber(document.NumFiscal) !== null,
-    );
+    return hashTaxDocument(lastDocument.xmlCheck);
   }
 
   async clearOfflineDocuments(
@@ -879,12 +1072,10 @@ export class TaxRegisterService {
     }
 
     const documents = await this._getDocuments(id);
-    await this._saveDocuments(
-      id,
-      documents.filter(
-        (document) => this._getOfflineLocalNumber(document.NumFiscal) === null,
-      ),
+    const remainingDocuments = documents.filter(
+      (document) => this._getOfflineLocalNumber(document.NumFiscal) === null,
     );
+    await this._saveDocuments(id, remainingDocuments);
     await this._saveContext(id, {
       ...context,
       registerState: {
@@ -892,18 +1083,6 @@ export class TaxRegisterService {
         OfflineNextLocalNum: '1',
       },
     });
-    this.stateChanged.emit(id);
-  }
-
-  async getOfflineParts(
-    taxRegisterId: TaxRegisterContextId,
-    offlineNextLocalNum: number,
-  ): Promise<string[][]> {
-    const docs = await this.getOfflineDocuments(
-      taxRegisterId,
-      offlineNextLocalNum,
-    );
-    return this._chunkOfflineParts(docs);
   }
 
   // The latest session's offline documents in journal order, starting inclusively at the
@@ -960,16 +1139,6 @@ export class TaxRegisterService {
     );
   }
 
-  private _chunkOfflineParts(docs: string[]): string[][] {
-    const chunkSize = this.offlineSettings.offlinePackageDocumentLimit;
-    const parts: string[][] = [];
-    for (let index = 0; index < docs.length; index += chunkSize) {
-      parts.push(docs.slice(index, index + chunkSize));
-    }
-
-    return parts;
-  }
-
   // Marks the current session's OfflineBegin to revoke the original online document. Allowed
   // only while the server has accepted nothing from this session (offline counter 1) and
   // expects OfflineBegin's number next, which means it accepted the original.
@@ -1019,21 +1188,24 @@ export class TaxRegisterService {
       `</CASHREGISTERNUM>
 <REVOKELASTONLINEDOC>true</REVOKELASTONLINEDOC>`,
     );
-    documents[offlineBeginIndex] = this._parseDocument(updatedXml);
+    documents[offlineBeginIndex] = this._withJournalData(
+      this._parseDocument(updatedXml),
+      offlineBegin,
+    );
     await this._saveDocuments(id, documents);
     return true;
   }
 
   private async _getContext(
     taxRegisterId: TaxRegisterContextId,
-  ): Promise<TaxRegisterContext | null> {
+  ): Promise<TaxRegisterContext<TConfig> | null> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     const cachedContext = this._contexts.get(id);
     if (cachedContext) {
       return cachedContext;
     }
 
-    const context = await this._storage.get<TaxRegisterContext>(
+    const context = await this._storage.get<TaxRegisterContext<TConfig>>(
       this._getStorageKey(id),
     );
     if (context) {
@@ -1045,19 +1217,15 @@ export class TaxRegisterService {
 
   private async _saveContext(
     taxRegisterId: TaxRegisterContextId,
-    context: TaxRegisterContext,
+    context: TaxRegisterContext<TConfig>,
   ): Promise<void> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     await this._storage.set(this._getStorageKey(id), context);
     this._contexts.set(id, context);
   }
 
-  private _getTaxRegisterId(taxConfig: ITaxConfig): string {
+  private _getTaxRegisterId(taxConfig: TConfig): string {
     return this._normalizeTaxRegisterId(taxConfig?.taxRegister?.fiscalNumber);
-  }
-
-  private _getStoreId(taxConfig: ITaxConfig): number {
-    return this._normalizeStoreId(taxConfig?.store?.erpStoreId);
   }
 
   private _getStorageKey(taxRegisterId: TaxRegisterContextId): string {
@@ -1065,16 +1233,12 @@ export class TaxRegisterService {
     return `${TAX_REGISTER_CONTEXT_KEY_PREFIX}${id}`;
   }
 
-  private _getStoreStorageKey(storeId: number): string {
-    return `${TAX_REGISTER_STORE_KEY_PREFIX}${this._normalizeStoreId(storeId)}`;
-  }
-
   private async _getDocuments(
     taxRegisterId: TaxRegisterContextId,
-  ): Promise<DocumentItem[]> {
+  ): Promise<TaxJournalDocument[]> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     return (
-      (await this._storage.get<DocumentItem[]>(
+      (await this._storage.get<TaxJournalDocument[]>(
         this._getDocumentsStorageKey(id),
       )) || []
     );
@@ -1082,7 +1246,7 @@ export class TaxRegisterService {
 
   private async _saveDocuments(
     taxRegisterId: TaxRegisterContextId,
-    documents: DocumentItem[],
+    documents: TaxJournalDocument[],
   ): Promise<void> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     await this._storage.set(this._getDocumentsStorageKey(id), documents);
@@ -1113,7 +1277,9 @@ export class TaxRegisterService {
       throw new Error('Tax document must be raw XML.');
     }
 
-    const parsedDocument = parseXml<ParsedTaxDocument>(rawXml);
+    const parsedDocument = parseXml<ParsedTaxDocument>(rawXml, {
+      keepText: FISCAL_NUMBER_ELEMENTS,
+    });
     const head =
       parsedDocument?.CHECK?.CHECKHEAD || parsedDocument?.ZREP?.ZREPHEAD;
     if (!head) {
@@ -1126,7 +1292,7 @@ export class TaxRegisterService {
     }
 
     const document = new DocumentItem();
-    document.NumFiscal = head.ORDERTAXNUM?.toString();
+    document.NumFiscal = head.ORDERTAXNUM?.toString().trim();
     document.NumLocal = orderNumber;
     document.DocDateTime = this._getDocumentDateTime(head);
     document.DocClass = parsedDocument.CHECK ? 'Check' : 'ZRep';
@@ -1183,14 +1349,10 @@ export class TaxRegisterService {
       return '';
     }
 
-    const date = head.ORDERDATE.toString();
-    const time = head.ORDERTIME.toString().padStart(6, '0');
-    const year = date.slice(-4);
-    const month = date.slice(-6, -4);
-    const day = date.slice(0, -6).padStart(2, '0');
-    const hours = time.slice(0, -4);
-    const minutes = time.slice(-4, -2);
-    const seconds = time.slice(-2);
+    const { year, month, day, hours, minutes, seconds } = parseOrderDateTime(
+      head.ORDERDATE,
+      head.ORDERTIME,
+    );
     return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
   }
 
@@ -1213,7 +1375,9 @@ export class TaxRegisterService {
         index--;
         continue;
       }
-      const parsed = parseXml<ParsedTaxDocument>(item.xmlCheck);
+      const parsed = parseXml<ParsedTaxDocument>(item.xmlCheck, {
+        keepText: FISCAL_NUMBER_ELEMENTS,
+      });
       if (item.CheckDocType === 'OpenShift') {
         shiftStart = { item, parsed };
         break;
@@ -1241,7 +1405,26 @@ export class TaxRegisterService {
       result.Totals = this._ensureShiftTotals(result.Totals);
     }
 
+    // The server registers a storno with a zero storned amount: the storned check is left out
+    // along with the storno itself. A check stored only in the baseline cannot be removed.
+    const stornedFiscalNumbers = new Set(
+      documentsInShift
+        .map((document) => document.parsed.CHECK?.CHECKHEAD)
+        .filter(
+          (head) =>
+            Number(head?.DOCSUBTYPE) === TaxDocumentSubType.CHECK_STORNO &&
+            this._hasValue(head.ORDERSTORNUM),
+        )
+        .map((head) => String(head.ORDERSTORNUM).trim()),
+    );
+
     for (const document of documentsInShift) {
+      if (
+        this._hasValue(document.item.NumFiscal) &&
+        stornedFiscalNumbers.has(String(document.item.NumFiscal).trim())
+      ) {
+        continue;
+      }
       if (document.item.DocClass === 'ZRep') {
         result.ZRepPresent = true;
         result.ZRepFiscalNum = document.item.NumFiscal;
@@ -1458,6 +1641,32 @@ export class TaxRegisterService {
     }
   }
 
+  // The offline credentials in force come from the newest journal entry that put them in force
+  // (an online shift-opening receipt or an end-session response); without one, from the server
+  // state the context was initialized with. Until an offline document follows that entry, the
+  // next offline session starts at 1.
+  private _applyOfflineCredentials(
+    state: TaxRegisterState,
+    documents: TaxJournalDocument[],
+  ): void {
+    for (let index = documents.length - 1; index >= 0; index--) {
+      const credentials = documents[index].offlineCredentials;
+      if (!credentials) {
+        continue;
+      }
+
+      state.OfflineSessionId = String(credentials.OfflineSessionId);
+      state.OfflineSeed = String(credentials.OfflineSeed);
+      const offlineDocumentFollows = documents
+        .slice(index + 1)
+        .some((document) => this._getOfflineLocalNumber(document.NumFiscal) !== null);
+      if (!offlineDocumentFollows) {
+        state.OfflineNextLocalNum = '1';
+      }
+      return;
+    }
+  }
+
   private _getLastShiftOpening(
     documents: DocumentItem[],
   ): { item: DocumentItem; head: TaxDocumentHead } | null {
@@ -1519,6 +1728,19 @@ export class TaxRegisterService {
     return currentNumber === null ? null : (currentNumber + 1).toString();
   }
 
+  // The journal is saved in local-number order, so the server has all of it when its next
+  // local number is past the last document's. An unreadable number proves nothing.
+  private _hasDocumentsMissingOnServer(
+    documents: DocumentItem[],
+    registerState: TransactionsRegistrarStateResponse,
+  ): boolean {
+    const lastDocument = documents[documents.length - 1];
+    return (
+      !!lastDocument &&
+      !(Number(lastDocument.NumLocal) < Number(registerState.NextLocalNum))
+    );
+  }
+
   private _isOffline(
     state: TransactionsRegistrarStateResponse & { Offline?: boolean },
   ): boolean {
@@ -1527,37 +1749,8 @@ export class TaxRegisterService {
     );
   }
 
-  private _stringifyError(error: unknown): string {
-    if (error == null) {
-      return String(error);
-    }
-    if (typeof error === 'string') {
-      return error;
-    }
-    if (error instanceof Error) {
-      return error.message || error.name;
-    }
-    if (typeof error === 'object') {
-      const details = error as {
-        message?: string;
-        error?: string;
-        ResultText?: string;
-        text?: string;
-      };
-      return (
-        details.message ||
-        details.error ||
-        details.ResultText ||
-        details.text ||
-        JSON.stringify(error)
-      );
-    }
-
-    return String(error);
-  }
-
   private _getCurrentNextOrderNumber(
-    context: TaxRegisterContext,
+    context: TaxRegisterContext<TConfig>,
     documents: DocumentItem[],
   ): number {
     const stateNextOrderNumber = Number(context.registerState.NextLocalNum);
@@ -1571,15 +1764,6 @@ export class TaxRegisterService {
 
   private _toBoolean(value: boolean | string): boolean {
     return value === true || value === 'true';
-  }
-
-  private _normalizeStoreId(storeId: number): number {
-    const id = Number(storeId);
-    if (!Number.isInteger(id) || id < 0) {
-      throw new Error('Store id is required.');
-    }
-
-    return id;
   }
 
   private _normalizeTaxRegisterId(taxRegisterId: TaxRegisterContextId): string {

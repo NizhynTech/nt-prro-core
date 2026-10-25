@@ -7,7 +7,8 @@
 // - an empty element becomes null;
 // - attributes are '@name' keys; text next to attributes or child elements is '#text';
 //   CDATA is '#cdata';
-// - every string that reads as a number becomes a number ("0012" -> 12, "1.5" -> 1.5).
+// - every string that reads as a number becomes a number ("0012" -> 12, "1.5" -> 1.5),
+//   except where the keepText option keeps it as text.
 
 export type XmlObject = Record<string, any>;
 
@@ -33,13 +34,30 @@ const NAMED_ENTITIES: Record<string, string> = {
 const NON_WHITESPACE = /[^ \f\n\r\t\v]/;
 const NAME_END = /[ \f\n\r\t\v/>=<]/;
 
-export function parseXml<T extends XmlObject = XmlObject>(xml: string): T {
+export interface ParseXmlOptions {
+  // Values kept as text instead of numbers: true for all, or the names of the elements (and
+  // '@attribute' names) to keep. Use it for identifiers and codes whose leading zeros or
+  // digits must not be lost (ORDERDATE, ORDERTAXNUM, TIN, offline seeds).
+  keepText?: boolean | readonly string[];
+}
+
+type KeepText = (name: string) => boolean;
+
+export function parseXml<T extends XmlObject = XmlObject>(
+  xml: string,
+  options: ParseXmlOptions = {},
+): T {
   if (typeof xml !== 'string') {
     throw new Error('XML must be a string.');
   }
 
+  const keepText = options.keepText;
+  const names = Array.isArray(keepText) ? new Set(keepText) : null;
+  const isKept: KeepText =
+    keepText === true ? () => true : names ? (name) => names.has(name) : () => false;
+
   const root = new XmlReader(xml).readDocument();
-  return { [root.name]: toValue(root) } as T;
+  return { [root.name]: toValue(root, isKept) } as T;
 }
 
 class XmlReader {
@@ -223,7 +241,7 @@ class XmlReader {
   }
 }
 
-function toValue(element: XmlElement): unknown {
+function toValue(element: XmlElement, isKept: KeepText): unknown {
   const nodes = element.children.filter(
     (node) => node.kind !== 'text' || NON_WHITESPACE.test(node.value),
   );
@@ -233,18 +251,18 @@ function toValue(element: XmlElement): unknown {
 
   const result: XmlObject = {};
   for (const [name, value] of element.attributes) {
-    result[`@${name}`] = toScalar(value);
+    result[`@${name}`] = toScalar(value, isKept(`@${name}`));
   }
 
   if (nodes.some((node) => node.kind === 'element')) {
     for (const node of nodes) {
       if (node.kind === 'text') {
-        result['#text'] = toScalar(node.value);
+        result['#text'] = toScalar(node.value, isKept(element.name));
       } else if (node.kind === 'cdata') {
-        result['#cdata'] = toScalar(node.value);
+        result['#cdata'] = toScalar(node.value, isKept(element.name));
       } else {
         const name = node.element.name;
-        const value = toValue(node.element);
+        const value = toValue(node.element, isKept);
         if (!(name in result)) {
           result[name] = value;
         } else if (Array.isArray(result[name])) {
@@ -264,18 +282,18 @@ function toValue(element: XmlElement): unknown {
   const text = textOf('text');
   if (text) {
     if (!element.attributes.length) {
-      return toScalar(text);
+      return toScalar(text, isKept(element.name));
     }
-    result['#text'] = toScalar(text);
+    result['#text'] = toScalar(text, isKept(element.name));
     return result;
   }
 
-  result['#cdata'] = toScalar(textOf('cdata'));
+  result['#cdata'] = toScalar(textOf('cdata'), isKept(element.name));
   return result;
 }
 
-function toScalar(value: string): string | number {
-  return isNaN(+value) ? value : +value;
+function toScalar(value: string, keepText: boolean): string | number {
+  return keepText || isNaN(+value) ? value : +value;
 }
 
 function decodeEntities(value: string): string {

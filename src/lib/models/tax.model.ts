@@ -190,14 +190,21 @@ export interface TotalsCurrencyDetails {
   StorCommission: number; // Повернуто суму комісії з сторно конвертації
 }
 
-// Application configuration of one tax register: the organization, the store (tax object),
-// the register and its cashiers.
-export interface ITaxConfig {
+// What the tax register service needs from the application's register configuration: the
+// register's fiscal number, which identifies its context. An application keeps any other
+// data it needs in the same object (see ITaxConfig); the service stores it unchanged.
+export interface TaxRegisterConfig {
+  taxRegister?: { fiscalNumber?: string | number } | null;
+}
+
+// Application configuration of one tax register: the organization, the register and its
+// cashiers. How a register relates to the application's own entities (points of sale,
+// stores) is up to the application.
+export interface ITaxConfig extends TaxRegisterConfig {
   tin: string;
   ipn: string;
   orgFullName: string;
   cashiers: Cashier[];
-  store: TaxConfigStore;
 
   active: boolean;
   taxRegister: TaxConfigRegister;
@@ -212,32 +219,13 @@ export interface ITaxConfig {
   editSettings?: boolean;
   editTaxObject?: boolean;
   editTaxRegister?: boolean;
-  taxObjects?: TaxConfigStore[];
   taxObjectsLoading?: boolean;
   taxObjectsError: boolean;
-  stores?: TaxConfigStore[];
   isNewOrg: boolean;
   shiftView?: boolean;
   registerStateView?: boolean;
   privateLoaded?: boolean;
   error?: string;
-}
-
-export interface TaxConfigStore {
-  id: string;
-  erpStoreId: number;
-  erpStoreName: string;
-  typeObjectName: string;
-  name: string;
-  toCode: number;
-  address: string;
-  stanObject: string;
-  typeOfRights: string;
-  accStart: string;
-  distr: string;
-  lastCh: string;
-  territ: string;
-  taxRegisters: TaxConfigRegister[];
 }
 
 export interface TaxConfigRegister {

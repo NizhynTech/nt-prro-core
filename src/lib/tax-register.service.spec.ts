@@ -13,16 +13,20 @@ import {
   TaxRegisterContext,
   TaxRegisterService,
 } from './tax-register.service.js';
+import {
+  getOfflineControlNumber,
+  getOfflineControlString,
+} from './documents/offline-fiscal-number.js';
+import { parseXml } from './utils/xml-parser.js';
 
 describe('TaxRegisterService', () => {
   let service: TaxRegisterService;
   let storedValues: Map<string, unknown>;
   let storage: jasmine.SpyObj<TaxContextStorage>;
 
-  const createConfig = (fiscalNumber: string, storeId = 1): ITaxConfig =>
+  const createConfig = (fiscalNumber: string): ITaxConfig =>
     ({
       tin: '1234567890',
-      store: { erpStoreId: storeId },
       taxRegister: { fiscalNumber },
     }) as ITaxConfig;
 
@@ -69,6 +73,13 @@ describe('TaxRegisterService', () => {
     service = new TaxRegisterService(storage);
   });
 
+  // Saves documents one by one, as a client does.
+  const saveAll = async (target: TaxRegisterService, xmls: string[]) => {
+    for (const xml of xmls) {
+      await target.saveDocument('register-1', xml);
+    }
+  };
+
   it('initializes a persisted context from the supplied values', async () => {
     const taxConfig = createConfig('register-1');
     const currentTime = new Date('2026-09-20T12:00:01Z');
@@ -84,7 +95,6 @@ describe('TaxRegisterService', () => {
     expect(
       storedValues.get('TAX_REGISTER_CONTEXT__register-1'),
     ).toEqual({
-      storeId: 1,
       taxConfig,
       registerState,
       lastShiftTotals,
@@ -94,7 +104,6 @@ describe('TaxRegisterService', () => {
       },
       disabled: true,
     } as TaxRegisterContext);
-    expect(storedValues.get('TAX_REGISTER_STORE__1')).toBe('register-1');
     expect(storedValues.get('TAX_REGISTER_DOCUMENTS__register-1')).toEqual([]);
     expect(await service.isDisabled('register-1')).toBeTrue();
   });
@@ -153,7 +162,7 @@ describe('TaxRegisterService', () => {
       serverState,
     );
     await service.initContext(
-      createConfig('register-2', 2),
+      createConfig('register-2'),
       registerState,
       lastShiftTotals,
       serverState,
@@ -200,7 +209,7 @@ describe('TaxRegisterService', () => {
       serverState,
     );
     await service.initContext(
-      createConfig('register-2', 2),
+      createConfig('register-2'),
       { ...registerState, UID: 'second-register-state' },
       lastShiftTotals,
       serverState,
@@ -210,32 +219,31 @@ describe('TaxRegisterService', () => {
     expect(storedValues.has('TAX_REGISTER_CONTEXT__register-2')).toBeTrue();
   });
 
-  it('gets the stored tax register by store id', async () => {
-    const config = createConfig('register-1', 15);
-    await service.initContext(
+  it('keeps the application config unchanged and stores nothing besides it', async () => {
+    interface AppConfig extends ITaxConfig {
+      store: { erpStoreId: number };
+    }
+    const appService = new TaxRegisterService<AppConfig>(storage);
+    const config = {
+      ...createConfig('register-1'),
+      store: { erpStoreId: 15 },
+    } as AppConfig;
+
+    await appService.initContext(
       config,
       registerState,
       lastShiftTotals,
       serverState,
     );
-    const restoredService = new TaxRegisterService(storage);
 
-    expect(await restoredService.getTaxRegisterByStoreId(15)).toEqual(
-      config.taxRegister,
-    );
-    expect(await restoredService.getTaxRegisterByStoreId(16)).toBeNull();
-  });
-
-  it('resolves the tax register id from a store mapping', async () => {
-    await service.initContext(
-      createConfig('register-1', 15),
-      registerState,
-      lastShiftTotals,
-      serverState,
-    );
-
-    expect(await service.getTaxRegisterIdByStoreId(15)).toBe('register-1');
-    expect(await service.getTaxRegisterIdByStoreId(16)).toBeNull();
+    const restored = await new TaxRegisterService<AppConfig>(
+      storage,
+    ).getTaxConfig('register-1');
+    expect(restored.store.erpStoreId).toBe(15);
+    expect(Array.from(storedValues.keys()).sort()).toEqual([
+      'TAX_REGISTER_CONTEXT__register-1',
+      'TAX_REGISTER_DOCUMENTS__register-1',
+    ]);
   });
 
   it('does not overwrite newer offline state with an older incoming state', async () => {
@@ -283,15 +291,89 @@ describe('TaxRegisterService', () => {
       }),
     );
 
+    // force skips only the snapshot check: document 20 is still missing on the server.
+    expect(
+      await service.initContext(
+        createConfig('register-1'),
+        olderIncomingState,
+        openedShiftTotals,
+        serverState,
+        true,
+      ),
+    ).toBeFalse();
+    expect(await service.getDocuments('register-1')).toHaveSize(1);
+
     const forceInitialized = await service.initContext(
       createConfig('register-1'),
-      olderIncomingState,
+      { ...olderIncomingState, NextLocalNum: 21 },
       openedShiftTotals,
       serverState,
       true,
     );
 
     expect(forceInitialized).toBeTrue();
+    expect(await service.getDocuments('register-1')).toEqual([]);
+  });
+
+  it('keeps journal documents the server does not have, even when forced', async () => {
+    await service.initContext(
+      createConfig('register-1'),
+      registerState,
+      openedShiftTotals,
+      serverState,
+    );
+    // An offline session started after the last synchronization: the snapshot is online.
+    await service.saveDocument(
+      'register-1',
+      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><ORDERNUM>10</ORDERNUM>' +
+        '<ORDERTAXNUM>77.1.100</ORDERTAXNUM><OFFLINE>true</OFFLINE>' +
+        '</CHECKHEAD></CHECK>',
+    );
+    const init = (state: TransactionsRegistrarStateResponse, force = false) =>
+      service.initContext(
+        createConfig('register-1'),
+        state,
+        openedShiftTotals,
+        serverState,
+        force,
+      );
+
+    expect(await init(registerState)).toBeFalse();
+    expect(await init(registerState, true)).toBeFalse();
+    expect(
+      await init({ ...registerState, NextLocalNum: undefined }, true),
+    ).toBeFalse();
+    expect(await service.getDocuments('register-1')).toHaveSize(1);
+    expect((await service.getState('register-1')).OfflineSession).toBeTrue();
+
+    expect(await init({ ...registerState, NextLocalNum: 11 })).toBeTrue();
+    expect(await service.getDocuments('register-1')).toEqual([]);
+  });
+
+  it('counts a revoked document like any other journal document', async () => {
+    await service.initContext(
+      createConfig('register-1'),
+      registerState,
+      openedShiftTotals,
+      serverState,
+    );
+    await service.saveDocument(
+      'register-1',
+      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><ORDERNUM>10</ORDERNUM><VER>1</VER>' +
+        '<REVOKED>true</REVOKED></CHECKHEAD></CHECK>',
+    );
+    const init = (nextLocalNum: number) =>
+      service.initContext(
+        createConfig('register-1'),
+        { ...registerState, NextLocalNum: nextLocalNum },
+        openedShiftTotals,
+        serverState,
+      );
+
+    expect(await init(10)).toBeFalse();
+    expect(await service.getDocuments('register-1')).toHaveSize(1);
+
+    expect(await init(11)).toBeTrue();
     expect(await service.getDocuments('register-1')).toEqual([]);
   });
 
@@ -317,9 +399,6 @@ describe('TaxRegisterService', () => {
     );
     expect(await restoredService.hasContext('register-1')).toBeTrue();
     expect(await restoredService.hasContext('missing-register')).toBeFalse();
-    expect(
-      await restoredService.hasOfflineDocs('register-1'),
-    ).toBeFalse();
   });
 
   it('disables a context without removing stored settings', async () => {
@@ -344,50 +423,6 @@ describe('TaxRegisterService', () => {
     expect(await service.getAllTaxConfigs()).toEqual([taxConfig]);
   });
 
-  it('updates server state and removes documents older than NextLocalNum', async () => {
-    await service.initContext(
-      createConfig('register-1'),
-      { ...registerState, NextLocalNum: 9 },
-      openedShiftTotals,
-      serverState,
-    );
-    for (const orderNumber of [9, 10, 11]) {
-      await service.saveDocument(
-        'register-1',
-        `<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><ORDERNUM>${orderNumber}</ORDERNUM>` +
-          `<ORDERTAXNUM>${orderNumber}</ORDERTAXNUM></CHECKHEAD></CHECK>`,
-      );
-    }
-    const updatedState = {
-      ...registerState,
-      NextLocalNum: 11,
-      OfflineNextLocalNum: '3',
-    } as TransactionsRegistrarStateResponse;
-
-    await service.updateServerState('register-1', updatedState);
-
-    const context = storedValues.get(
-      'TAX_REGISTER_CONTEXT__register-1',
-    ) as TaxRegisterContext;
-    expect(context.registerState).toEqual(updatedState);
-    expect(
-      (await service.getDocuments('register-1')).map(
-        (document) => document.NumLocal,
-      ),
-    ).toEqual([11]);
-    expect((await service.getState('register-1')).Offline).toBeFalse();
-    expect((await service.getState('register-1')).OfflineSession).toBeFalse();
-
-    await service.updateServerState('register-1', {
-      ...updatedState,
-      NextLocalNum: 12,
-      OfflineNextLocalNum: '1',
-    });
-
-    expect(await service.getDocuments('register-1')).toEqual([]);
-    expect((await service.getState('register-1')).Offline).toBeFalse();
-  });
-
   it('finishes an offline session using the package response', async () => {
     await service.initContext(
       createConfig('register-1'),
@@ -406,30 +441,33 @@ describe('TaxRegisterService', () => {
         '<ORDERTAXNUM>100.1.1</ORDERTAXNUM><OFFLINE>true</OFFLINE>' +
         '</CHECKHEAD></CHECK>',
     );
-    await service.saveDocument(
+    const totalsBeforeFinish = await service.getLastTotals('register-1');
+    const contextBefore = storedValues.get('TAX_REGISTER_CONTEXT__register-1');
+
+    await service.completeOfflineSession(
       'register-1',
       '<CHECK><CHECKHEAD><DOCTYPE>103</DOCTYPE><ORDERNUM>11</ORDERNUM>' +
         '<ORDERTAXNUM>100.2.2</ORDERTAXNUM><OFFLINE>true</OFFLINE>' +
         '</CHECKHEAD></CHECK>',
+      { OfflineSessionId: 60259556, OfflineSeed: 668820867191246 },
     );
-    const totalsBeforeFinish = await service.getLastTotals('register-1');
 
-    await service.finishOfflineSession('register-1', {
-      OfflineSessionId: 60259556,
-      OfflineSeed: 668820867191246,
-    });
-
+    // One journal write: the context itself is not written.
     const context = storedValues.get(
       'TAX_REGISTER_CONTEXT__register-1',
     ) as TaxRegisterContext;
-    expect(context.registerState.OfflineSessionId).toBe('60259556');
-    expect(context.registerState.OfflineSeed).toBe(
-      '668820867191246',
-    );
-    expect(context.registerState.OfflineNextLocalNum).toBe('1');
-    expect(context.registerState.NextLocalNum).toBe(10);
-    expect((await service.getState('register-1')).NextLocalNum).toBe(12);
+    expect(context).toBe(contextBefore as TaxRegisterContext);
+    expect(context.registerState.OfflineSessionId).toBe('100');
     expect(context.lastShiftTotals).toEqual(lastShiftTotals);
+    const documents = await service.getDocuments('register-1');
+    expect(documents[1].offlineCredentials).toEqual({
+      OfflineSessionId: '60259556',
+      OfflineSeed: '668820867191246',
+    });
+    const finished = await service.getState('register-1');
+    expect(finished.OfflineSessionId).toBe('60259556');
+    expect(finished.OfflineSeed).toBe('668820867191246');
+    expect(finished.NextLocalNum).toBe(12);
     expect(await service.getLastTotals('register-1')).toEqual(
       totalsBeforeFinish,
     );
@@ -476,42 +514,10 @@ describe('TaxRegisterService', () => {
     expect(await service.getDocuments('register-1')).toEqual([
       jasmine.objectContaining({ xmlCheck: onlineXml }),
     ]);
-    expect(await service.hasOfflineDocs('register-1')).toBeFalse();
     expect((await service.getState('register-1')).OfflineNextLocalNum).toBe(
       '1',
     );
     expect((await service.getState('register-1')).Offline).toBeFalse();
-  });
-
-  it('saves and returns offline session errors', async () => {
-    await service.initContext(
-      createConfig('register-1'),
-      registerState,
-      lastShiftTotals,
-      serverState,
-    );
-
-    await service.saveOfflineSessionError(
-      'register-1',
-      new Error('Сервер податкової недоступний'),
-      'stopOfflineSession',
-    );
-    await service.saveOfflineSessionError(
-      'register-1',
-      'PackageValidationError',
-      'stopOfflineSession',
-    );
-
-    expect(await service.getOfflineSessionErrors('register-1')).toEqual([
-      jasmine.objectContaining({
-        message: 'Сервер податкової недоступний',
-        operation: 'stopOfflineSession',
-      }),
-      jasmine.objectContaining({
-        message: 'PackageValidationError',
-        operation: 'stopOfflineSession',
-      }),
-    ]);
   });
 
   it('updates the stored config without replacing context values', async () => {
@@ -696,7 +702,6 @@ describe('TaxRegisterService', () => {
     expect(state.ShiftState).toBe(1);
     expect(state.ZRepPresent).toBeFalse();
     expect(state.Testing).toBeTrue();
-    expect(await service.hasOfflineDocs('register-1')).toBeTrue();
     await expectAsync(
       service.validateNextDocument('register-1', 102),
     ).toBeResolved();
@@ -746,7 +751,7 @@ describe('TaxRegisterService', () => {
     it('rejects a new offline document once the session has the maximum number of documents', async () => {
       const target = withSettings({ maxOfflineDocuments: 3 });
       await initOpenShift(target);
-      await target.saveDocuments('register-1', [
+      await saveAll(target, [
         offlineXml(102, 10, 1),
         offlineXml(0, 11, 2),
       ]);
@@ -766,7 +771,7 @@ describe('TaxRegisterService', () => {
       const target = withSettings({ maxOfflineSessionDurationMinutes: 30 * 60 });
       await initOpenShift(target);
       const startedAt = new Date(Date.now() - 31 * 60 * 60 * 1000);
-      await target.saveDocuments('register-1', [
+      await saveAll(target, [
         offlineXml(102, 10, 1, startedAt),
         offlineXml(0, 11, 2, startedAt),
       ]);
@@ -781,7 +786,7 @@ describe('TaxRegisterService', () => {
       const target = withSettings({ maxOfflineSessionDurationMinutes: 30 * 60 });
       await initOpenShift(target);
       const startedAt = new Date(Date.now() - 29 * 60 * 60 * 1000);
-      await target.saveDocuments('register-1', [
+      await saveAll(target, [
         offlineXml(102, 10, 1, startedAt),
         offlineXml(0, 11, 2, startedAt),
       ]);
@@ -789,16 +794,11 @@ describe('TaxRegisterService', () => {
       await expectAsync(target.validateNextDocument('register-1', 0)).toBeResolved();
     });
 
-    it('uses the settings package size for offline parts', async () => {
-      const target = withSettings({ offlinePackageDocumentLimit: 2 });
-      await initOpenShift(target);
-      const xmls = [offlineXml(102, 10, 1), offlineXml(0, 11, 2), offlineXml(0, 12, 3)];
-      await target.saveDocuments('register-1', xmls);
-
-      expect(await target.getOfflineParts('register-1', 1)).toEqual([
-        xmls.slice(0, 2),
-        xmls.slice(2),
-      ]);
+    it('exposes the package size from the settings', () => {
+      expect(
+        withSettings({ offlinePackageDocumentLimit: 2 }).offlineSettings
+          .offlinePackageDocumentLimit,
+      ).toBe(2);
     });
   });
 
@@ -832,44 +832,143 @@ describe('TaxRegisterService', () => {
     expect(state.OfflineSession).toBeTrue();
   });
 
-  it('saves a group of documents in one journal write', async () => {
-    await service.initContext(
-      createConfig('register-1'),
-      { ...registerState, OfflineNextLocalNum: '1' },
-      openedShiftTotals,
-      serverState,
-    );
-    const xmls = [
-      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><ORDERNUM>10</ORDERNUM></CHECKHEAD></CHECK>',
-      '<CHECK><CHECKHEAD><DOCTYPE>102</DOCTYPE><ORDERNUM>11</ORDERNUM>' +
-        '<ORDERTAXNUM>77.1.100</ORDERTAXNUM><OFFLINE>true</OFFLINE></CHECKHEAD></CHECK>',
-      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><ORDERNUM>12</ORDERNUM>' +
-        '<ORDERTAXNUM>77.2.101</ORDERTAXNUM><OFFLINE>true</OFFLINE></CHECKHEAD></CHECK>',
-    ];
+  describe('starting an offline session', () => {
+    const seed = '179625192271939';
+    const offlineState = {
+      ...registerState,
+      OfflineSupported: true,
+      OfflineSessionId: '77',
+      OfflineSeed: seed,
+      OfflineNextLocalNum: '1',
+      OfflineSessionDuration: '0',
+      OfflineSessionsMonthlyDuration: '0',
+    } as TransactionsRegistrarStateResponse;
+    const body =
+      '<CHECKTOTAL><SUM>100.00</SUM></CHECKTOTAL>\r\n' +
+      '<CHECKBODY><ROW ROWNUM="1"><NAME>Кава</NAME><COST>100.00</COST></ROW></CHECKBODY>\r\n';
+    const original = (numLocal = 10) =>
+      '<?xml version="1.0" encoding="windows-1251"?>\r\n<CHECK>\r\n<CHECKHEAD>\r\n' +
+      '<DOCTYPE>0</DOCTYPE>\r\n<UID>u-1</UID>\r\n<TIN>01234567</TIN>\r\n' +
+      '<ORGNM>ТОВ &quot;Тест&quot;</ORGNM>\r\n<POINTNM>Кафе</POINTNM>\r\n' +
+      '<POINTADDR>Київ</POINTADDR>\r\n<ORDERDATE>30092026</ORDERDATE>\r\n' +
+      `<ORDERTIME>235959</ORDERTIME>\r\n<ORDERNUM>${numLocal}</ORDERNUM>\r\n` +
+      '<CASHDESKNUM>19</CASHDESKNUM>\r\n<CASHREGISTERNUM>4000002411</CASHREGISTERNUM>\r\n' +
+      '<CASHIER>Касир</CASHIER>\r\n<VER>1</VER>\r\n<TESTING>true</TESTING>\r\n' +
+      `</CHECKHEAD>\r\n${body}</CHECK>`;
+    const control = (orderNumber: number, checkTotal?: string) =>
+      getOfflineControlNumber(
+        getOfflineControlString({
+          seed,
+          orderDate: '01102026',
+          orderTime: '093005',
+          orderNumber,
+          cashRegisterNum: '4000002411',
+          cashDeskNum: '19',
+          checkTotal,
+        }),
+      );
+    const init = (target = service, state = offlineState) =>
+      target.initContext(createConfig('register-1'), state, openedShiftTotals, serverState);
 
-    await service.saveDocuments('register-1', xmls);
+    beforeEach(() => {
+      jasmine.clock().install();
+      jasmine.clock().mockDate(new Date(2026, 9, 1, 9, 30, 5));
+    });
 
-    expect((await service.getDocuments('register-1')).length).toBe(3);
-    const state = await service.getState('register-1');
-    expect(state.NextLocalNum).toBe(13);
-    expect(state.OfflineNextLocalNum).toBe('3');
-  });
+    afterEach(() => jasmine.clock().uninstall());
 
-  it('rejects a document group with a numbering gap and saves none of it', async () => {
-    await service.initContext(
-      createConfig('register-1'),
-      registerState,
-      openedShiftTotals,
-      serverState,
-    );
+    it('stores the revoked original, OfflineBegin and the offline copy in one write', async () => {
+      await init();
 
-    await expectAsync(
-      service.saveDocuments('register-1', [
-        '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><ORDERNUM>10</ORDERNUM></CHECKHEAD></CHECK>',
-        '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><ORDERNUM>12</ORDERNUM></CHECKHEAD></CHECK>',
-      ]),
-    ).toBeRejectedWithError('Tax document local number 12 is invalid. Expected 11.');
-    expect(await service.getDocuments('register-1')).toEqual([]);
+      const copy = await service.startOfflineSession('register-1', original());
+
+      const [revoked, begin, offlineCopy] = await service.getDocuments('register-1');
+      expect(revoked.xmlCheck).toBe(
+        original().replace('<VER>1</VER>', '<VER>1</VER><REVOKED>true</REVOKED>'),
+      );
+      expect(revoked.Revoked).toBeTrue();
+
+      expect(begin.CheckDocType).toBe('OfflineBegin');
+      expect(begin.NumLocal).toBe(11);
+      expect(begin.NumFiscal).toBe(`77.1.${control(11)}`);
+      const beginHead = parseXml<{ CHECK: { CHECKHEAD: Record<string, string> } }>(
+        begin.xmlCheck,
+        { keepText: true },
+      ).CHECK.CHECKHEAD;
+      expect(beginHead.UID).toBe('u-1');
+      expect(beginHead.TIN).toBe('01234567');
+      expect(beginHead.ORGNM).toBe('ТОВ "Тест"');
+      expect(beginHead.ORDERDATE).toBe('01102026');
+      expect(beginHead.ORDERTIME).toBe('093005');
+      expect(beginHead.TESTING).toBeUndefined();
+
+      const header = offlineCopy.xmlCheck.slice(0, offlineCopy.xmlCheck.indexOf('</CHECKHEAD>'));
+      expect(copy).toBe(offlineCopy.xmlCheck);
+      expect(offlineCopy.NumLocal).toBe(12);
+      expect(offlineCopy.NumFiscal).toBe(`77.2.${control(12, '100.00')}`);
+      expect(header).toContain('<UID>u-1</UID>');
+      expect(header).toContain('<ORDERDATE>01102026</ORDERDATE>');
+      expect(header).toContain('<ORDERTIME>093005</ORDERTIME>');
+      expect(header).toContain(
+        `<VER>1</VER><ORDERTAXNUM>77.2.${control(12, '100.00')}</ORDERTAXNUM>` +
+          '<OFFLINE>true</OFFLINE>\r\n<TESTING>true</TESTING>',
+      );
+      expect(offlineCopy.xmlCheck.endsWith(`</CHECKHEAD>\r\n${body}</CHECK>`)).toBeTrue();
+
+      const state = await service.getState('register-1');
+      expect(state.NextLocalNum).toBe(13);
+      expect(state.OfflineNextLocalNum).toBe('3');
+      expect(state.OfflineSession).toBeTrue();
+      const totals = await service.getLastTotals('register-1');
+      expect(totals.Totals.Real.Sum).toBe(100);
+      expect(totals.Totals.Real.OrdersCount).toBe(1);
+      expect((await service.getStagedDocumentBatch()).length).toBe(3);
+    });
+
+    it('converts a Z-report without a sum in the control number', async () => {
+      await init();
+      const zReport =
+        '<ZREP><ZREPHEAD><UID>z-1</UID><TIN>01234567</TIN><ORGNM>ТОВ</ORGNM>' +
+        '<POINTNM>Кафе</POINTNM><POINTADDR>Київ</POINTADDR><ORDERDATE>30092026</ORDERDATE>' +
+        '<ORDERTIME>235959</ORDERTIME><ORDERNUM>10</ORDERNUM><CASHDESKNUM>19</CASHDESKNUM>' +
+        '<CASHREGISTERNUM>4000002411</CASHREGISTERNUM><CASHIER>Касир</CASHIER><VER>1</VER>' +
+        '</ZREPHEAD><ZREPBODY><SERVICEINPUT>0.00</SERVICEINPUT></ZREPBODY></ZREP>';
+
+      const copy = await service.startOfflineSession('register-1', zReport);
+
+      expect(copy).toContain(
+        `<VER>1</VER><ORDERTAXNUM>77.2.${control(12)}</ORDERTAXNUM><OFFLINE>true</OFFLINE>`,
+      );
+      expect(copy).toContain('<ZREPBODY><SERVICEINPUT>0.00</SERVICEINPUT></ZREPBODY>');
+      expect((await service.getDocuments('register-1'))[1].CheckDocType).toBe(
+        'OfflineBegin',
+      );
+    });
+
+    it('saves nothing when the register cannot start offline or the original does not fit', async () => {
+      const disabled = new TaxRegisterService(storage, { offlineEnabled: false });
+      await init(disabled);
+      await expectAsync(
+        disabled.startOfflineSession('register-1', original()),
+      ).toBeRejectedWithError('Роботу ПРРО в режимі офлайн вимкнено в налаштуваннях.');
+
+      await init(service, { ...offlineState, OfflineSeed: null });
+      await expectAsync(
+        service.startOfflineSession('register-1', original()),
+      ).toBeRejectedWithError('Каса не підтримує офлайн режим.');
+
+      await init();
+      await expectAsync(
+        service.startOfflineSession(
+          'register-1',
+          original().replace('<VER>1</VER>', '<VER>1</VER><OFFLINE>true</OFFLINE>'),
+        ),
+      ).toBeRejectedWithError(/Офлайн сесію починає лише документ/);
+      await expectAsync(
+        service.startOfflineSession('register-1', original(12)),
+      ).toBeRejectedWithError('Tax document local number 12 is invalid. Expected 10.');
+      expect(await service.getDocuments('register-1')).toEqual([]);
+    });
   });
 
   it('completes an offline session with the end document and the next credentials', async () => {
@@ -953,7 +1052,7 @@ describe('TaxRegisterService', () => {
       openedShiftTotals,
       serverState,
     );
-    await service.saveDocuments('register-1', [
+    await saveAll(service, [
       '<CHECK><CHECKHEAD><DOCTYPE>100</DOCTYPE><ORDERNUM>10</ORDERNUM></CHECKHEAD></CHECK>',
       '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><DOCSUBTYPE>3</DOCSUBTYPE>' +
         '<ORDERNUM>11</ORDERNUM></CHECKHEAD>' +
@@ -1042,6 +1141,60 @@ describe('TaxRegisterService', () => {
     expect(totals.Totals.Ret.Sum).toBe(30);
     expect(totals.Totals.Ret.OrdersCount).toBe(1);
     expect(totals.Totals.ServiceInput).toBe(50);
+  });
+
+  it('leaves out a storno and the check it storns', async () => {
+    await service.initContext(
+      createConfig('register-1'),
+      { ...registerState, NextLocalNum: 10 },
+      openedShiftTotals,
+      serverState,
+    );
+    const sale = (numLocal: number, fiscalNumber: string, sum: number) =>
+      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><DOCSUBTYPE>0</DOCSUBTYPE>' +
+      `<ORDERNUM>${numLocal}</ORDERNUM><VER>1</VER><ORDERTAXNUM>${fiscalNumber}</ORDERTAXNUM>` +
+      `</CHECKHEAD><CHECKTOTAL><SUM>${sum}</SUM></CHECKTOTAL>` +
+      '<CHECKPAY><ROW><PAYFORMCD>0</PAYFORMCD><PAYFORMNM>Cash</PAYFORMNM>' +
+      `<SUM>${sum}</SUM></ROW></CHECKPAY></CHECK>`;
+    await saveAll(service, [
+      sale(10, '4000100', 100),
+      sale(11, '4000101', 50),
+      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><DOCSUBTYPE>5</DOCSUBTYPE>' +
+        '<ORDERNUM>12</ORDERNUM><ORDERSTORNUM>4000101</ORDERSTORNUM>' +
+        '</CHECKHEAD></CHECK>',
+    ]);
+
+    const totals = await service.getLastTotals('register-1');
+
+    expect(totals.Totals.Real.Sum).toBe(100);
+    expect(totals.Totals.Real.OrdersCount).toBe(1);
+    expect(totals.Totals.Real.PayForm[0].Sum).toBe(100);
+  });
+
+  it('matches a storno to its check by the fiscal number as written', async () => {
+    await service.initContext(
+      createConfig('register-1'),
+      { ...registerState, NextLocalNum: 10 },
+      openedShiftTotals,
+      serverState,
+    );
+    const sale = (numLocal: number, fiscalNumber: string, sum: number) =>
+      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><DOCSUBTYPE>0</DOCSUBTYPE>' +
+      `<ORDERNUM>${numLocal}</ORDERNUM><VER>1</VER><ORDERTAXNUM>${fiscalNumber}</ORDERTAXNUM>` +
+      `</CHECKHEAD><CHECKTOTAL><SUM>${sum}</SUM></CHECKTOTAL></CHECK>`;
+    // Both read as the number 9007199254740992; as text they are different checks.
+    await saveAll(service, [
+      sale(10, '9007199254740992', 100),
+      sale(11, '9007199254740993', 50),
+      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><DOCSUBTYPE>5</DOCSUBTYPE>' +
+        '<ORDERNUM>12</ORDERNUM><ORDERSTORNUM>9007199254740993</ORDERSTORNUM>' +
+        '</CHECKHEAD></CHECK>',
+    ]);
+
+    const totals = await service.getLastTotals('register-1');
+
+    expect(totals.Totals.Real.Sum).toBe(100);
+    expect(totals.Totals.Real.OrdersCount).toBe(1);
   });
 
   it('skips only the document immediately before OfflineBegin', async () => {
@@ -1272,8 +1425,9 @@ describe('TaxRegisterService', () => {
     await service.saveDocument('register-1', offlineBeginXml);
     await service.saveDocument('register-1', offlineCheckXml);
 
-    expect(await service.getOfflineParts('register-1', 1)).toEqual([
-      [offlineBeginXml, offlineCheckXml],
+    expect(await service.getOfflineDocuments('register-1', 1)).toEqual([
+      offlineBeginXml,
+      offlineCheckXml,
     ]);
   });
 
@@ -1304,13 +1458,14 @@ describe('TaxRegisterService', () => {
     await service.saveDocument('register-1', secondXml);
     await service.saveDocument('register-1', thirdXml);
 
-    expect(await service.getOfflineParts('register-1', 2)).toEqual([
-      [secondXml, thirdXml],
+    expect(await service.getOfflineDocuments('register-1', 2)).toEqual([
+      secondXml,
+      thirdXml,
     ]);
     // The server has every document: nothing ordinary remains, only the end.
-    expect(await service.getOfflineParts('register-1', 4)).toEqual([]);
+    expect(await service.getOfflineDocuments('register-1', 4)).toEqual([]);
     // A server position beyond the local session is not silently ignored.
-    await expectAsync(service.getOfflineParts('register-1', 5)).toBeRejected();
+    await expectAsync(service.getOfflineDocuments('register-1', 5)).toBeRejected();
   });
 
   it('selects only the latest session documents', async () => {
@@ -1330,8 +1485,8 @@ describe('TaxRegisterService', () => {
       '<ORDERTAXNUM>77.1.100</ORDERTAXNUM><OFFLINE>true</OFFLINE></CHECKHEAD></CHECK>';
     await service.saveDocument('register-1', beginXml);
 
-    expect(await service.getOfflineParts('register-1', 1)).toEqual([[beginXml]]);
-    await expectAsync(service.getOfflineParts('register-1', 5)).toBeRejected();
+    expect(await service.getOfflineDocuments('register-1', 1)).toEqual([beginXml]);
+    await expectAsync(service.getOfflineDocuments('register-1', 5)).toBeRejected();
   });
 
   it('walks back to the requested offline document and includes it', async () => {
@@ -1361,43 +1516,293 @@ describe('TaxRegisterService', () => {
     await service.saveDocument('register-1', secondXml);
     await service.saveDocument('register-1', fourthXml);
 
-    expect(await service.getOfflineParts('register-1', 1)).toEqual([
-      [firstXml, secondXml, fourthXml],
+    expect(await service.getOfflineDocuments('register-1', 1)).toEqual([
+      firstXml,
+      secondXml,
+      fourthXml,
     ]);
-    expect(await service.getOfflineParts('register-1', 2)).toEqual([
-      [secondXml, fourthXml],
+    expect(await service.getOfflineDocuments('register-1', 2)).toEqual([
+      secondXml,
+      fourthXml,
     ]);
     // A gap at the server's position is an unresolved state, not permission to skip.
-    await expectAsync(service.getOfflineParts('register-1', 3)).toBeRejected();
+    await expectAsync(service.getOfflineDocuments('register-1', 3)).toBeRejected();
   });
 
-  it('splits offline documents into packages of 50', async () => {
-    await service.initContext(
-      createConfig('register-1'),
-      {
-        ...registerState,
-        OfflineSessionId: '77',
-        OfflineNextLocalNum: '1',
-      },
-      openedShiftTotals,
-      serverState,
-    );
+  describe('saving with the server receipt', () => {
+    const uid = 'C0FFEE00-0000-4000-8000-000000000001';
+    const openShiftXml = (numLocal: number, offline = false) =>
+      `<CHECK><CHECKHEAD><DOCTYPE>100</DOCTYPE><UID>${uid}</UID>` +
+      `<ORDERNUM>${numLocal}</ORDERNUM><VER>1</VER>` +
+      (offline ? `<ORDERTAXNUM>77.2.100</ORDERTAXNUM><OFFLINE>true</OFFLINE>` : '') +
+      '</CHECKHEAD></CHECK>';
+    const ticket = (numLocal: number, extra = '') =>
+      `<?xml version="1.0" encoding="windows-1251"?><TICKET><UID>${uid.toLowerCase()}</UID>` +
+      `<ORDERNUM>${numLocal}</ORDERNUM><ORDERTAXNUM>4000${numLocal}</ORDERTAXNUM>${extra}` +
+      '<VER>1</VER></TICKET>';
+    const credentials =
+      '<OFFLINESESSIONID>123456789012345678</OFFLINESESSIONID>' +
+      '<OFFLINESEED>987654321098765432</OFFLINESEED>';
+    const init = () =>
+      service.initContext(
+        createConfig('register-1'),
+        {
+          ...registerState,
+          OfflineSessionId: '100',
+          OfflineSeed: '200',
+          OfflineNextLocalNum: '1',
+        },
+        lastShiftTotals,
+        serverState,
+      );
 
-    const documents: string[] = [];
-    for (let index = 1; index <= 51; index++) {
-      const xml =
-        `<CHECK><CHECKHEAD><DOCTYPE>${index === 1 ? 102 : 0}</DOCTYPE>` +
-        `<ORDERNUM>${9 + index}</ORDERNUM>` +
-        `<ORDERTAXNUM>77.${index}.100</ORDERTAXNUM>` +
-        '<OFFLINE>true</OFFLINE></CHECKHEAD></CHECK>';
-      documents.push(xml);
-      await service.saveDocument('register-1', xml);
-    }
+    it('writes the fiscal number, keeps the receipt and returns the saved XML', async () => {
+      await init();
 
-    expect(await service.getOfflineParts('register-1', 1)).toEqual([
-      documents.slice(0, 50),
-      documents.slice(50),
-    ]);
+      const saved = await service.saveDocument(
+        'register-1',
+        openShiftXml(10),
+        ticket(10),
+      );
+
+      expect(saved).toContain('</VER><ORDERTAXNUM>400010</ORDERTAXNUM>');
+      const [document] = await service.getDocuments('register-1');
+      expect(document.xmlCheck).toBe(saved);
+      expect(document.NumFiscal).toBe('400010');
+      expect(document.ticketXml).toBe(ticket(10));
+      expect(await service.getStagedDocumentBatch()).toEqual([saved]);
+    });
+
+    it('keeps the fiscal number as written, with leading zeros and all digits', async () => {
+      await init();
+      const fiscalNumber = '0012345678901234567';
+
+      await service.saveDocument(
+        'register-1',
+        openShiftXml(10),
+        ticket(10).replace('<ORDERTAXNUM>400010<', `<ORDERTAXNUM>${fiscalNumber}<`),
+      );
+
+      const [document] = await service.getDocuments('register-1');
+      expect(document.NumFiscal).toBe(fiscalNumber);
+      expect(document.xmlCheck).toContain(`<ORDERTAXNUM>${fiscalNumber}</ORDERTAXNUM>`);
+    });
+
+    it('puts the shift-opening credentials in force with the document, in one write', async () => {
+      await init();
+      const contextBefore = storedValues.get('TAX_REGISTER_CONTEXT__register-1');
+
+      await service.saveDocument(
+        'register-1',
+        openShiftXml(10),
+        ticket(10, credentials),
+      );
+
+      expect(storedValues.get('TAX_REGISTER_CONTEXT__register-1')).toBe(
+        contextBefore,
+      );
+      const state = await service.getState('register-1');
+      expect(state.OfflineSessionId).toBe('123456789012345678');
+      expect(state.OfflineSeed).toBe('987654321098765432');
+      expect(state.OfflineNextLocalNum).toBe('1');
+      expect(state.ShiftState).toBe(1);
+    });
+
+    it('keeps the credentials in force when the receipt has none', async () => {
+      await init();
+
+      await service.saveDocument('register-1', openShiftXml(10), ticket(10));
+
+      const state = await service.getState('register-1');
+      expect(state.OfflineSessionId).toBe('100');
+      expect(state.OfflineSeed).toBe('200');
+    });
+
+    it('takes credentials only from an online shift opening', async () => {
+      await init();
+      await service.saveDocument(
+        'register-1',
+        '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><UID>' + uid + '</UID><ORDERNUM>10</ORDERNUM>' +
+          '<VER>1</VER></CHECKHEAD></CHECK>',
+        ticket(10, credentials),
+      );
+
+      expect((await service.getState('register-1')).OfflineSessionId).toBe('100');
+    });
+
+    it('numbers the offline documents after the new credentials from their session', async () => {
+      await init();
+      await service.saveDocument('register-1', openShiftXml(10), ticket(10, credentials));
+      await saveAll(service, [
+        '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><ORDERNUM>11</ORDERNUM></CHECKHEAD></CHECK>',
+        '<CHECK><CHECKHEAD><DOCTYPE>102</DOCTYPE><ORDERNUM>12</ORDERNUM>' +
+          '<ORDERTAXNUM>123456789012345678.1.100</ORDERTAXNUM><OFFLINE>true</OFFLINE>' +
+          '</CHECKHEAD></CHECK>',
+      ]);
+
+      const state = await service.getState('register-1');
+      expect(state.OfflineSessionId).toBe('123456789012345678');
+      expect(state.OfflineNextLocalNum).toBe('2');
+      expect(state.OfflineSession).toBeTrue();
+    });
+
+    it('rejects a receipt for another document and saves nothing', async () => {
+      await init();
+
+      await expectAsync(
+        service.saveDocument('register-1', openShiftXml(10), ticket(11, credentials)),
+      ).toBeRejectedWithError(/належить іншому документу \(номер 11, очікується 10\)/);
+      await expectAsync(
+        service.saveDocument(
+          'register-1',
+          openShiftXml(10),
+          ticket(10).replace(uid.toLowerCase(), 'another-uid'),
+        ),
+      ).toBeRejectedWithError(/належить іншому документу \(UID another-uid\)/);
+      expect(await service.getDocuments('register-1')).toEqual([]);
+      expect((await service.getState('register-1')).OfflineSessionId).toBe('100');
+    });
+
+    it('ignores ERRORCODE when the receipt carries the fiscal number', async () => {
+      await init();
+
+      // Like the official example, which shows every element at once.
+      const saved = await service.saveDocument(
+        'register-1',
+        openShiftXml(10),
+        ticket(
+          10,
+          credentials +
+            '<ERRORCODE>1</ERRORCODE><ERRORTEXT>РРО не зареєстрований</ERRORTEXT>',
+        ),
+      );
+
+      expect(saved).toContain('<ORDERTAXNUM>400010</ORDERTAXNUM>');
+      expect((await service.getState('register-1')).OfflineSessionId).toBe(
+        '123456789012345678',
+      );
+    });
+
+    it('rejects a receipt that reports an error without a fiscal number and saves nothing', async () => {
+      await init();
+      const errorTicket =
+        `<TICKET><UID>${uid}</UID><ORDERNUM>10</ORDERNUM><ERRORCODE>7</ERRORCODE>` +
+        '<ERRORTEXT>Невірний локальний номер чека, очікується 12</ERRORTEXT><VER>1</VER></TICKET>';
+
+      await expectAsync(
+        service.saveDocument('register-1', openShiftXml(10), errorTicket),
+      ).toBeRejectedWithError(
+        'Код помилки: 7 CheckLocalNumberInvalid\r\nНевірний локальний номер чека, очікується 12',
+      );
+      expect(await service.getDocuments('register-1')).toEqual([]);
+    });
+
+    it('replaces a fiscal number already in the document', async () => {
+      await init();
+
+      const saved = await service.saveDocument(
+        'register-1',
+        openShiftXml(10).replace('</VER>', '</VER><ORDERTAXNUM>1</ORDERTAXNUM>'),
+        ticket(10),
+      );
+
+      expect(saved).toContain('</VER><ORDERTAXNUM>400010</ORDERTAXNUM></CHECKHEAD>');
+      expect((await service.getDocuments('register-1'))[0].NumFiscal).toBe('400010');
+    });
+
+    it('refuses a receipt for an offline document', async () => {
+      await init();
+
+      await expectAsync(
+        service.saveDocument('register-1', openShiftXml(10, true), ticket(10)),
+      ).toBeRejectedWithError('Офлайн документ не має квитанції сервера.');
+      expect(await service.getDocuments('register-1')).toEqual([]);
+    });
+
+    it('uses the server credentials for journals saved before receipts were kept', async () => {
+      await init();
+      await service.saveDocument('register-1', openShiftXml(10));
+
+      expect((await service.getState('register-1')).OfflineSessionId).toBe('100');
+    });
+
+    it('accepts only an offline end in completeOfflineSession', async () => {
+      await init();
+
+      await expectAsync(
+        service.completeOfflineSession('register-1', openShiftXml(10), {
+          OfflineSessionId: '1',
+          OfflineSeed: '2',
+        }),
+      ).toBeRejectedWithError('Tax document is not an offline session end.');
+      expect(await service.getDocuments('register-1')).toEqual([]);
+    });
+  });
+
+  describe('cancelled registration', () => {
+    const cancelledState = {
+      ...registerState,
+      ShiftState: 1,
+      Closed: true,
+    } as TransactionsRegistrarStateResponse;
+    const message = 'Реєстрацію ПРРО скасовано: нові документи не створюються.';
+
+    it('disables the register and rejects every new document', async () => {
+      await service.initContext(
+        createConfig('register-1'),
+        cancelledState,
+        openedShiftTotals,
+        serverState,
+      );
+      await service.initContext(
+        createConfig('register-2'),
+        registerState,
+        openedShiftTotals,
+        serverState,
+      );
+      await service.setDisabled('register-2', false);
+
+      expect(await service.isDisabled('register-1')).toBeTrue();
+      await expectAsync(
+        service.setDisabled('register-1', false),
+      ).toBeRejectedWithError('Реєстрацію ПРРО скасовано: касу не можна увімкнути.');
+      expect(
+        (await service.getAllTaxConfigs()).map((config) => config.taxRegister.fiscalNumber),
+      ).toEqual(['register-2']);
+      // Sale, shift closing, Z-report (no DOCTYPE) and offline begin.
+      for (const docType of [0, 101, undefined, 102]) {
+        await expectAsync(
+          service.validateNextDocument('register-1', docType),
+        ).toBeRejectedWithError(message);
+      }
+      await expectAsync(
+        service.validateNextDocument('register-2', 0),
+      ).toBeResolved();
+    });
+
+    it('disables an enabled register when a later state reports the cancellation', async () => {
+      await service.initContext(
+        createConfig('register-1'),
+        registerState,
+        openedShiftTotals,
+        serverState,
+      );
+      await service.setDisabled('register-1', false);
+      expect(await service.isDisabled('register-1')).toBeFalse();
+
+      await service.initContext(
+        createConfig('register-1'),
+        cancelledState,
+        openedShiftTotals,
+        serverState,
+        true,
+      );
+
+      expect(await service.isDisabled('register-1')).toBeTrue();
+      expect(
+        (await service.getTaxContext('register-1')).disabled,
+      ).toBeTrue();
+    });
   });
 
   describe('package API', () => {
@@ -1429,13 +1834,9 @@ describe('TaxRegisterService', () => {
       expect(dynamic.offlineSettings.offlineEnabled).toBeFalse();
     });
 
-    it('works with the in-memory storage and emits state changes', async () => {
+    it('works with the in-memory storage', async () => {
       const memoryService = new TaxRegisterService(
         new InMemoryTaxContextStorage(),
-      );
-      const changes: string[] = [];
-      const subscription = memoryService.stateChanged.subscribe((id) =>
-        changes.push(id),
       );
 
       await memoryService.initContext(
@@ -1444,28 +1845,10 @@ describe('TaxRegisterService', () => {
         openedShiftTotals,
         serverState,
       );
-      subscription.unsubscribe();
       await memoryService.setDisabled('register-1', false);
 
-      expect(changes).toEqual(['register-1']);
-      expect(await memoryService.getTaxRegisterIdByStoreId(1)).toBe(
-        'register-1',
-      );
+      expect(await memoryService.hasContext('register-1')).toBeTrue();
       expect(await memoryService.isDisabled('register-1')).toBeFalse();
-    });
-
-    it('keeps emitting to other listeners when one throws', () => {
-      const received: string[] = [];
-      service.stateChanged.subscribe(() => {
-        throw new Error('listener failed');
-      });
-      service.stateChanged.subscribe((id) => received.push(id));
-      spyOn(Promise, 'reject').and.returnValue(Promise.resolve() as never);
-
-      service.stateChanged.emit('register-1');
-
-      expect(received).toEqual(['register-1']);
-      expect(Promise.reject).toHaveBeenCalled();
     });
   });
 });

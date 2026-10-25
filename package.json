@@ -17,11 +17,15 @@
     "README.md"
   ],
   "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NizhynTech/nt-prro-core.git"
+  },
   "scripts": {
     "clean": "node -e \"for (const dir of ['dist', '.test']) require('fs').rmSync(dir, { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.build.json",
     "test": "npm run clean && tsc -p tsconfig.spec.json && jasmine --config=jasmine.json",
-    "prepack": "npm run build"
+    "prepare": "npm run build"
   },
   "dependencies": {
     "js-sha256": "^0.11.0"
