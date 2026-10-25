@@ -1,0 +1,34 @@
+{
+  "name": "tax-register-core",
+  "version": "0.0.1",
+  "description": "Local state of Ukrainian software cash registers (PRRO): context, document journal, offline session rules and shift totals. Plain TypeScript, no framework dependencies.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "clean": "node -e \"for (const dir of ['dist', '.test']) require('fs').rmSync(dir, { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "test": "npm run clean && tsc -p tsconfig.spec.json && jasmine --config=jasmine.json",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "js-sha256": "^0.11.0"
+  },
+  "devDependencies": {
+    "@types/jasmine": "5.1.4",
+    "jasmine": "5.1.0",
+    "typescript": "5.4.5"
+  }
+}
