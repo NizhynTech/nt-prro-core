@@ -4,12 +4,18 @@ import {
   parseOrderDateTime,
 } from './documents/document-date.js';
 import { hashTaxDocument } from './documents/document-hash.js';
-import { createDocumentHead } from './documents/document-head.js';
+import {
+  DocumentIssuer,
+  OfflineDocumentNumbering,
+  createDocumentHead,
+} from './documents/document-head.js';
 import {
   createOfflineFiscalNumber,
   getOfflineControlNumber,
   getOfflineControlString,
+  isPreviousDocumentHashRequired,
 } from './documents/offline-fiscal-number.js';
+import { CHECKHEAD } from './documents/tax-document.model.js';
 import { TaxDocumentUtility } from './documents/tax-document.utility.js';
 import {
   TaxTicket,
@@ -99,6 +105,27 @@ export type TaxRegisterContextSettingsSource =
   | Partial<TaxRegisterContextSettings>
   | (() => Partial<TaxRegisterContextSettings> | null | undefined);
 
+export interface TaxRegisterServiceOptions {
+  // UID of new documents. Default: crypto.randomUUID(), where the platform provides it.
+  createUid?: () => string;
+}
+
+// What only the caller knows about the next document; createDocumentHead takes the rest from
+// the register's context.
+export interface TaxDocumentHeadRequest {
+  docType?: number; // DOCTYPE; omitted for a Z-report
+  docSubType?: number;
+  cashier: string; // CASHIER: the operator whose key signs the document
+  // CHECKTOTAL/SUM formatted 0.00, as written in the body of a check that has one: part of an
+  // offline document's control number.
+  checkTotal?: string | null;
+  // TESTING of a shift opening, which starts a test or a fiscal shift. Other documents take
+  // the flag of the current shift.
+  testing?: boolean;
+  // Values replacing those of the register's TaxObject in the snapshot.
+  issuer?: Partial<DocumentIssuer>;
+}
+
 interface TaxDocumentHead {
   UID?: string;
   TIN?: number | string;
@@ -153,6 +180,7 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
   constructor(
     private _storage: TaxContextStorage,
     private _settings: TaxRegisterContextSettingsSource = {},
+    private _options: TaxRegisterServiceOptions = {},
   ) {
     if (!_storage) {
       throw new Error('Tax context storage is required.');
@@ -570,16 +598,7 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
         orderDate,
         orderTime,
         orderNumber: originalNumLocal + 1,
-        issuer: {
-          tin: this._text(head.TIN),
-          ipn: this._text(head.IPN) || undefined,
-          organizationName: this._text(head.ORGNM),
-          pointName: this._text(head.POINTNM),
-          pointAddress: this._text(head.POINTADDR),
-          cashRegisterNum: this._text(head.CASHREGISTERNUM),
-          cashDeskNum: Number(head.CASHDESKNUM),
-          cashier: this._text(head.CASHIER),
-        },
+        issuer: this._getHeadIssuer(head),
         offline: {
           sessionId: state.OfflineSessionId,
           seed: state.OfflineSeed,
@@ -617,6 +636,229 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
       { xml: offlineCopyXml },
     ]);
     return offlineCopyXml;
+  }
+
+  // Header of the next document, after the checks of validateNextDocument. The context gives:
+  // - UID (options.createUid), ORDERDATE/ORDERTIME (with the server time correction when it is
+  //   on), ORDERNUM, and TESTING of the current shift;
+  // - the issuer: the register's TaxObject in the snapshot, with request.issuer replacing its
+  //   values, and the register's fiscal number;
+  // - in an open offline session: OFFLINE, the offline fiscal number and, from the third
+  //   document of the session, PREVDOCHASH.
+  // The session start and end have their own methods. The header is valid until the next
+  // document is saved, so create, build and save one document at a time per register.
+  async createDocumentHead(
+    taxRegisterId: TaxRegisterContextId,
+    request: TaxDocumentHeadRequest,
+  ): Promise<CHECKHEAD> {
+    const id = this._normalizeTaxRegisterId(taxRegisterId);
+    const docType = request?.docType;
+    if (Number(docType) === TaxDocumentType.OOFFLINE_BEGIN) {
+      throw new Error('Початок офлайн сесії створює startOfflineSession.');
+    }
+    if (Number(docType) === TaxDocumentType.OFFLINE_END) {
+      throw new Error('Завершення офлайн сесії створює createOfflineSessionEnd.');
+    }
+    if (
+      this._hasValue(request.checkTotal) &&
+      !/^-?\d+\.\d{2}$/.test(String(request.checkTotal))
+    ) {
+      throw new Error(
+        `Сума чека для контрольного числа має формат 0.00: ${request.checkTotal}`,
+      );
+    }
+
+    await this.validateNextDocument(id, docType, request.docSubType);
+    const context = await this._getContext(id);
+    const state = await this.getState(id);
+    return this._createHead(id, state, {
+      docType,
+      docSubType: request.docSubType,
+      issuer: this._getDocumentIssuer(id, context, request.issuer, request.cashier),
+      checkTotal: request.checkTotal,
+      testing:
+        Number(docType) === TaxDocumentType.OPEN_SHIFT
+          ? !!request.testing
+          : state.Testing,
+    });
+  }
+
+  // The end-session document (OfflineEnd) of the open session. It is not saved: send it in the
+  // final package and save it with completeOfflineSession once the server accepts it. It takes
+  // the issuer data of the session's OfflineBegin, as written, so both ends of the session
+  // agree, and carries the hash of the session's last document.
+  async createOfflineSessionEnd(
+    taxRegisterId: TaxRegisterContextId,
+    cashier: string,
+  ): Promise<string> {
+    const id = this._normalizeTaxRegisterId(taxRegisterId);
+    await this.validateNextDocument(id, TaxDocumentType.OFFLINE_END);
+    const context = await this._getContext(id);
+    const state = await this.getState(id);
+
+    const documents = await this._getDocuments(id);
+    const offlineBegin = [...documents]
+      .reverse()
+      .find((document) => document.CheckDocType === 'OfflineBegin');
+    const issuer = offlineBegin
+      ? {
+          ...this._getHeadIssuer(this._getDocumentHead(offlineBegin.xmlCheck, true)),
+          cashier: this._toCashier(cashier),
+        }
+      : this._getDocumentIssuer(id, context, undefined, cashier);
+
+    return TaxDocumentUtility.getChekDoc(
+      await this._createHead(id, state, {
+        docType: TaxDocumentType.OFFLINE_END,
+        issuer,
+      }),
+    );
+  }
+
+  private async _createHead(
+    id: string,
+    state: TaxRegisterState,
+    values: {
+      docType?: number;
+      docSubType?: number;
+      issuer: DocumentIssuer;
+      checkTotal?: string | null;
+      testing?: boolean;
+    },
+  ): Promise<CHECKHEAD> {
+    const now = await this._getDocumentClock(id);
+    return createDocumentHead({
+      docType: values.docType,
+      docSubType: values.docSubType,
+      uid: this._createUid(),
+      orderDate: formatOrderDate(now),
+      orderTime: formatOrderTime(now),
+      orderNumber: Number(state.NextLocalNum),
+      issuer: values.issuer,
+      testing: values.testing,
+      offline: state.OfflineSession
+        ? await this._getOfflineNumbering(id, state, values.checkTotal)
+        : null,
+    });
+  }
+
+  // Numbering of the next document of the open session, from the credentials in force.
+  private async _getOfflineNumbering(
+    id: string,
+    state: TaxRegisterState,
+    checkTotal?: string | null,
+  ): Promise<OfflineDocumentNumbering> {
+    const localNum = Number(state.OfflineNextLocalNum);
+    if (
+      !this._hasValue(state.OfflineSessionId) ||
+      !this._hasValue(state.OfflineSeed) ||
+      !Number.isInteger(localNum) ||
+      localNum < 1
+    ) {
+      throw new Error(
+        'Дані офлайн сесії відсутні або некоректні: офлайн документ не створюється.',
+      );
+    }
+
+    let previousDocumentHash: string | null = null;
+    if (isPreviousDocumentHashRequired(localNum)) {
+      previousDocumentHash = await this.getLastDocHash(id);
+      if (!previousDocumentHash) {
+        throw new Error(
+          'Немає попереднього документа офлайн сесії для PREVDOCHASH.',
+        );
+      }
+    }
+
+    return {
+      sessionId: String(state.OfflineSessionId),
+      seed: String(state.OfflineSeed),
+      localNum,
+      previousDocumentHash,
+      checkTotal: this._hasValue(checkTotal) ? String(checkTotal) : null,
+    };
+  }
+
+  // Issuer of new documents: the register's TaxObject in the snapshot, overridden by the
+  // caller's values; the register number is always the register's fiscal number. Throws when a
+  // value the schema requires is missing.
+  private _getDocumentIssuer(
+    id: string,
+    context: TaxRegisterContext<TConfig>,
+    override: Partial<DocumentIssuer> | undefined,
+    cashier: string,
+  ): DocumentIssuer {
+    const taxObject = context?.registerState?.TaxObject;
+    const registrar = taxObject?.TransactionsRegistrars?.find(
+      (item) => String(item?.NumFiscal ?? '').trim() === id,
+    );
+    const replaced = Object.fromEntries(
+      Object.entries(override || {}).filter(([, value]) => this._hasValue(value)),
+    ) as Partial<DocumentIssuer>;
+    const issuer: DocumentIssuer = {
+      tin: this._text(taxObject?.Tin),
+      ipn: this._text(taxObject?.Ipn) || undefined,
+      organizationName: this._text(taxObject?.OrgName),
+      pointName: this._text(taxObject?.Name),
+      pointAddress: this._text(taxObject?.Address),
+      cashDeskNum: Number(registrar?.NumLocal),
+      ...replaced,
+      cashRegisterNum: id,
+      cashier: this._toCashier(cashier),
+    };
+
+    const missing = [
+      !this._hasValue(issuer.tin) && 'TIN',
+      !this._hasValue(issuer.organizationName) && 'ORGNM',
+      !this._hasValue(issuer.pointName) && 'POINTNM',
+      !(Number.isInteger(Number(issuer.cashDeskNum)) && Number(issuer.cashDeskNum) > 0) &&
+        'CASHDESKNUM',
+    ].filter(Boolean);
+    if (missing.length) {
+      throw new Error(
+        `Немає даних ПРРО для документа: ${missing.join(', ')}. ` +
+          'Ініціалізуйте контекст зі станом, що містить TaxObject, або передайте issuer.',
+      );
+    }
+    return issuer;
+  }
+
+  // Issuer data of a document, as written in its header (parsed with keepText).
+  private _getHeadIssuer(head: TaxDocumentHead): DocumentIssuer {
+    return {
+      tin: this._text(head.TIN),
+      ipn: this._text(head.IPN) || undefined,
+      organizationName: this._text(head.ORGNM),
+      pointName: this._text(head.POINTNM),
+      pointAddress: this._text(head.POINTADDR),
+      cashRegisterNum: this._text(head.CASHREGISTERNUM),
+      cashDeskNum: Number(head.CASHDESKNUM),
+      cashier: this._text(head.CASHIER),
+    };
+  }
+
+  private _toCashier(cashier: string): string {
+    const name = cashier == null ? '' : String(cashier).trim();
+    if (!name) {
+      throw new Error('Не вказано касира документа.');
+    }
+    return name;
+  }
+
+  private _createUid(): string {
+    const createUid =
+      this._options.createUid ??
+      (() =>
+        (
+          globalThis as { crypto?: { randomUUID?: () => string } }
+        ).crypto?.randomUUID?.());
+    const uid = createUid();
+    if (!uid) {
+      throw new Error(
+        'Немає генератора UID документів: передайте createUid в опціях сервісу.',
+      );
+    }
+    return uid;
   }
 
   // The original as an offline document. In the header, ORDERDATE, ORDERTIME and ORDERNUM get

@@ -104,6 +104,8 @@ while (start < signedDocuments.length) {
 
 ### Заголовок документа
 
+Для ПРРО з контекстом заголовок будує сервіс: `context.createDocumentHead(id, request)` (див. «Створення документа»). Функція `createDocumentHead` нижче — для коду без контексту: усі значення передає той, хто викликає.
+
 `createDocumentHead` будує `CHECKHEAD` для `getChekDoc` або для полів `ITaxOrder` і застосовує правила офлайн документів:
 
 ```ts
@@ -210,7 +212,11 @@ const context = new TaxRegisterService(storage, () => ({
   maxOfflineSessionDurationMinutes: remoteConfig.taxMaxOfflineSessionMinutes,
   offlinePackageDocumentLimit: remoteConfig.taxOfflinePackageDocuments,
   useServerTimeCorrection: remoteConfig.usePrroServerTimeCorrection,
-}));
+}), {
+  // UID нових документів. Без нього — crypto.randomUUID(), якщо платформа його має
+  // (у браузері лише в безпечному контексті).
+  createUid: () => uuid(),
+});
 ```
 
 Сервіс не має подій. Після кожної зміни (збереження документа, ініціалізації, вимкнення ПРРО тощо) застосунок сам повідомляє свої екрани, якщо їм треба оновитися.
@@ -287,22 +293,39 @@ await context.setDisabled(taxConfig.taxRegister.fiscalNumber, false);
 ```ts
 const id = taxConfig.taxRegister.fiscalNumber;
 
-// Перевіряє, чи можна зараз створити документ цього типу.
-await context.validateNextDocument(id, TaxDocumentType.SALE_GOODS, 0);
+// Перевіряє документ (як validateNextDocument) і будує його заголовок з контексту.
+const head = await context.createDocumentHead(id, {
+  docType: TaxDocumentType.SALE_GOODS,
+  docSubType: 0,
+  cashier: signer.subjectFullName,
+  checkTotal: order.total.toFixed(2), // CHECKTOTAL/SUM, як у тілі чека
+});
 
-const state = await context.getState(id);
-// state.NextLocalNum — ORDERNUM нового документа;
-// state.OfflineSession / state.Offline — чи документ створюється офлайн;
-// state.OfflineSessionId, state.OfflineSeed, state.OfflineNextLocalNum — для офлайн номера.
-const prevDocHash = await context.getLastDocHash(id); // PREVDOCHASH офлайн документа
+const xml = buildCheckXml(head, order); // тіло формує застосунок
 
-const xml = buildCheckXml(order, state, prevDocHash); // формує застосунок
-
-// Онлайн: після того як сервер прийняв документ, разом із його квитанцією.
+// Онлайн (head.OFFLINE = false): після того як сервер прийняв документ, разом із квитанцією.
 const savedXml = await context.saveDocument(id, xml, ticketXml);
-// Офлайн: одразу після створення, без квитанції.
-await context.saveDocument(id, offlineXml);
+// Офлайн (head.OFFLINE = true): одразу після створення, без квитанції.
+await context.saveDocument(id, xml);
 ```
+
+`createDocumentHead` бере з контексту все, крім того, що знає лише застосунок:
+
+| Поле | Звідки |
+| --- | --- |
+| `DOCTYPE`, `DOCSUBTYPE` | `docType`, `docSubType` запиту. Для Z-звіту `docType` не передають |
+| `UID` | `createUid` з опцій сервісу |
+| `ORDERDATE`, `ORDERTIME` | Час пристрою або, з `useServerTimeCorrection`, оцінений час сервера |
+| `ORDERNUM` | `NextLocalNum` поточного стану |
+| `TIN`, `IPN`, `ORGNM`, `POINTNM`, `POINTADDR`, `CASHDESKNUM` | `TaxObject` у знімку стану сервера (`CASHDESKNUM` — `NumLocal` цього ПРРО в `TransactionsRegistrars`); значення з `issuer` запиту їх замінюють |
+| `CASHREGISTERNUM` | Фіскальний номер ПРРО |
+| `CASHIER` | `cashier` запиту: оператор, чиїм ключем підписують документ |
+| `TESTING` | Ознака поточної зміни; для відкриття зміни — `testing` запиту |
+| `OFFLINE`, `ORDERTAXNUM`, `PREVDOCHASH` | У відкритій офлайн сесії: чинні дані сесії, наступний номер у сесії, `checkTotal` запиту для контрольного числа і, з третього документа сесії, геш останнього документа журналу |
+
+Метод відхиляє запит, якщо документ не можна створити (ті самі перевірки, що й `validateNextDocument`), якщо немає обов'язкових за схемою даних продавця (`TIN`, `ORGNM`, `POINTNM`, `CASHDESKNUM`), касира, даних офлайн сесії, або якщо `checkTotal` не у форматі `0.00`. «Початок офлайн сесії» і «Завершення офлайн сесії» він не будує: для них є `startOfflineSession` і `createOfflineSessionEnd`.
+
+Заголовок дійсний, доки не збережено наступний документ: будуйте, надсилайте й зберігайте документи одного ПРРО по одному.
 
 `saveDocument` перевіряє, що `ORDERNUM` документа дорівнює очікуваному наступному номеру, і відхиляє документ з іншим номером. Повертає XML у тому вигляді, в якому його збережено.
 
@@ -357,13 +380,16 @@ await sendOfflinePackages(xmls);
 ### 4. Завершення офлайн сесії
 
 ```ts
-const endXml = buildOfflineEndXml(await context.getState(id));
+// Будує «Завершення офлайн сесії», але не зберігає його.
+const endXml = await context.createOfflineSessionEnd(id, signer.subjectFullName);
 const response = await api.sendOfflineEndPackage(endXml); // { OfflineSessionId, OfflineSeed }
 
 // Зберігає документ завершення разом із даними наступної сесії одним записом журналу.
 // Викликайте лише після успішної відповіді.
 await context.completeOfflineSession(id, endXml, response);
 ```
+
+`createOfflineSessionEnd` бере дані продавця з «Початку офлайн сесії» цієї сесії, як вони там записані, тож обидва документи сесії збігаються; касира — з параметра. Документ має наступні локальний номер і номер у сесії та геш останнього документа сесії. Сесію має бути відкрито, інакше `Код помилки: 15 OfflineSessionNotOpened …`.
 
 Після цього, коли сервер має всі документи, можна знову синхронізуватися через `initContext`.
 
@@ -451,10 +477,14 @@ export class AppTaxRegisterService extends TaxRegisterService<AppTaxConfig> {
   readonly stateChanged = new EventEmitter<string>();
 
   constructor(storage: CompanyStorage, settings: SettingsService) {
-    super(storage, () => ({
-      ...settings.taxOfflineSettings,
-      useServerTimeCorrection: settings.usePrroServerTimeCorrection,
-    }));
+    super(
+      storage,
+      () => ({
+        ...settings.taxOfflineSettings,
+        useServerTimeCorrection: settings.usePrroServerTimeCorrection,
+      }),
+      { createUid: () => UUID.UUID() },
+    );
   }
 
   override async saveDocument(id: string, xml: string, ticketXml?: string) {
@@ -509,6 +539,7 @@ const context = new TaxRegisterService(new InMemoryTaxContextStorage(), {
 | `getState(id)` | Поточний стан ПРРО з урахуванням журналу |
 | `getLastTotals(id)` | Підсумки поточної зміни з урахуванням журналу |
 | `validateNextDocument(id, docType, docSubType?)` | Перевірки перед створенням документа (див. вище) |
+| `createDocumentHead(id, request)` | Перевіряє документ і будує його `CHECKHEAD` з контексту; від застосунку — лише тип, касир, сума чека й ознака тестової зміни для її відкриття |
 | `saveDocument(id, xml, ticketXml?)` | Додає документ до журналу; з XML квитанції сервера — також фіскальний номер, квитанцію й дані офлайн сесії з відкриття зміни. Повертає збережений XML |
 | `startOfflineSession(id, originalXml)` | Продовжує документ офлайн після невдалої онлайн спроби: відкликаний документ, «Початок офлайн сесії» і офлайн копія одним записом журналу. Повертає XML офлайн копії |
 | `getDocuments(id)` | Журнал документів (`TaxJournalDocument[]`: `DocumentItem`, а також `ticketXml` і `offlineCredentials`, якщо вони є). `NumFiscal` — рядок, як записано в документі, без втрати нулів на початку й цифр |
@@ -520,6 +551,7 @@ const context = new TaxRegisterService(new InMemoryTaxContextStorage(), {
 | Метод | Опис |
 | --- | --- |
 | `offlineSettings` | Поточні нормалізовані налаштування |
+| `createOfflineSessionEnd(id, cashier)` | Будує «Завершення офлайн сесії» для відкритої сесії, не зберігаючи його |
 | `completeOfflineSession(id, endXml, nextSession)` | Зберігає документ завершення сесії разом із даними наступної сесії одним записом журналу |
 | `getOfflineDocuments(id, serverOfflineNextLocalNum)` | Документи поточної сесії, яких ще немає на сервері |
 | `revokeLastOnline(id, serverNextLocalNum, serverOfflineNextLocalNum)` | Додає `REVOKELASTONLINEDOC` у «Початок офлайн сесії», коли це допустимо. Повертає `true`, якщо документ змінено |

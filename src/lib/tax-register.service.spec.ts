@@ -2,8 +2,10 @@ import {
   DocumentItem,
   ITaxConfig,
   LastShiftTotalsResponse,
+  TaxObject,
   TransactionsRegistrarStateResponse,
 } from './models/tax.model.js';
+import { TaxDocumentUtility } from './documents/tax-document.utility.js';
 import { TaxOfflineSettings } from './models/tax-offline-settings.js';
 import {
   InMemoryTaxContextStorage,
@@ -830,6 +832,229 @@ describe('TaxRegisterService', () => {
 
     expect(state.Testing).toBeTrue();
     expect(state.OfflineSession).toBeTrue();
+  });
+
+  describe('creating document headers', () => {
+    const id = '4000002411';
+    const seed = '179625192271939';
+    const taxObject = {
+      Tin: '01234567',
+      Ipn: '012345678901',
+      OrgName: 'ТОВ "Тест"',
+      Name: 'Кафе',
+      Address: 'Київ',
+      TransactionsRegistrars: [
+        { NumFiscal: 4000002410, NumLocal: 18, Name: 'Інша каса', Closed: false },
+        { NumFiscal: 4000002411, NumLocal: 19, Name: 'Каса', Closed: false },
+      ],
+    } as unknown as TaxObject;
+    const state = {
+      ...registerState,
+      OfflineSupported: true,
+      OfflineSessionId: '77',
+      OfflineSeed: seed,
+      OfflineNextLocalNum: '1',
+      OfflineSessionDuration: '0',
+      OfflineSessionsMonthlyDuration: '0',
+      TaxObject: taxObject,
+    } as TransactionsRegistrarStateResponse;
+    // A sale registered online would have been 10; the session starts from it.
+    const original =
+      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><UID>u-1</UID><TIN>00000042</TIN>' +
+      '<ORGNM>ТОВ "Перший"</ORGNM><POINTNM>Кафе</POINTNM><POINTADDR>Київ</POINTADDR>' +
+      '<ORDERDATE>30092026</ORDERDATE><ORDERTIME>235959</ORDERTIME><ORDERNUM>10</ORDERNUM>' +
+      '<CASHDESKNUM>19</CASHDESKNUM><CASHREGISTERNUM>4000002411</CASHREGISTERNUM>' +
+      '<CASHIER>Касир</CASHIER><VER>1</VER></CHECKHEAD>' +
+      '<CHECKTOTAL><SUM>100.00</SUM></CHECKTOTAL></CHECK>';
+    const control = (
+      orderNumber: number,
+      checkTotal?: string,
+      previousDocumentHash?: string,
+    ) =>
+      getOfflineControlNumber(
+        getOfflineControlString({
+          seed,
+          orderDate: '01102026',
+          orderTime: '093005',
+          orderNumber,
+          cashRegisterNum: id,
+          cashDeskNum: 19,
+          checkTotal,
+          previousDocumentHash,
+        }),
+      );
+    let uids: number;
+    const createService = () =>
+      new TaxRegisterService(storage, {}, { createUid: () => `uid-${++uids}` });
+    const init = (
+      target: TaxRegisterService,
+      initState = state,
+      totals = openedShiftTotals,
+    ) => target.initContext(createConfig(id), initState, totals, serverState);
+    const headOf = (xml: string) =>
+      parseXml<{ CHECK: { CHECKHEAD: Record<string, string> } }>(xml, {
+        keepText: true,
+      }).CHECK.CHECKHEAD;
+
+    beforeEach(() => {
+      uids = 0;
+      jasmine.clock().install();
+      jasmine.clock().mockDate(new Date(2026, 9, 1, 9, 30, 5));
+    });
+
+    afterEach(() => jasmine.clock().uninstall());
+
+    it('fills an online header from the context and the TaxObject', async () => {
+      const target = createService();
+      await init(target);
+
+      const head = await target.createDocumentHead(id, {
+        docType: 0,
+        cashier: 'Касир',
+      });
+
+      expect(head).toEqual(
+        jasmine.objectContaining({
+          DOCTYPE: 0,
+          UID: 'uid-1',
+          TIN: '01234567',
+          IPN: '012345678901',
+          ORGNM: 'ТОВ "Тест"',
+          POINTNM: 'Кафе',
+          POINTADDR: 'Київ',
+          ORDERDATE: '01102026',
+          ORDERTIME: '093005',
+          ORDERNUM: 10,
+          CASHDESKNUM: 19,
+          CASHREGISTERNUM: id,
+          CASHIER: 'Касир',
+          OFFLINE: false,
+          ORDERTAXNUM: null,
+          PREVDOCHASH: null,
+        }),
+      );
+    });
+
+    it('takes TESTING of a shift opening from the request', async () => {
+      const target = createService();
+      await init(target, state, lastShiftTotals);
+
+      const head = await target.createDocumentHead(id, {
+        docType: 100,
+        cashier: 'Касир',
+        testing: true,
+      });
+
+      expect(head.TESTING).toBeTrue();
+    });
+
+    it('numbers a document of the open offline session', async () => {
+      const target = createService();
+      await init(target);
+      await target.startOfflineSession(id, original);
+      const previousHash = await target.getLastDocHash(id);
+
+      const head = await target.createDocumentHead(id, {
+        docType: 0,
+        cashier: 'Касир',
+        checkTotal: '50.00',
+      });
+
+      expect(head.ORDERNUM).toBe(13);
+      expect(head.OFFLINE).toBeTrue();
+      expect(head.PREVDOCHASH).toBe(previousHash);
+      expect(head.ORDERTAXNUM).toBe(`77.3.${control(13, '50.00', previousHash)}`);
+
+      await target.saveDocument(id, TaxDocumentUtility.getChekDoc(head));
+      const documents = await target.getDocuments(id);
+      expect(documents[documents.length - 1].NumFiscal).toBe(head.ORDERTAXNUM);
+    });
+
+    it('replaces TaxObject values with the request issuer and requires the schema values', async () => {
+      const target = createService();
+      await init(target, { ...state, TaxObject: undefined });
+
+      await expectAsync(
+        target.createDocumentHead(id, { docType: 0, cashier: 'Касир' }),
+      ).toBeRejectedWithError(/TIN, ORGNM, POINTNM, CASHDESKNUM/);
+
+      const head = await target.createDocumentHead(id, {
+        docType: 0,
+        cashier: 'Касир',
+        issuer: {
+          tin: '1234567890',
+          organizationName: 'ФОП Тест',
+          pointName: 'Магазин',
+          cashDeskNum: 3,
+          cashRegisterNum: '1',
+          pointAddress: undefined,
+        },
+      });
+      expect(head.TIN).toBe('1234567890');
+      expect(head.ORGNM).toBe('ФОП Тест');
+      expect(head.CASHDESKNUM).toBe(3);
+      expect(head.CASHREGISTERNUM).toBe(id);
+    });
+
+    it('refuses session documents, a malformed total, a missing cashier and invalid documents', async () => {
+      const target = createService();
+      await init(target);
+
+      await expectAsync(
+        target.createDocumentHead(id, { docType: 102, cashier: 'Касир' }),
+      ).toBeRejectedWithError(/startOfflineSession/);
+      await expectAsync(
+        target.createDocumentHead(id, { docType: 103, cashier: 'Касир' }),
+      ).toBeRejectedWithError(/createOfflineSessionEnd/);
+      await expectAsync(
+        target.createDocumentHead(id, { docType: 0, cashier: 'Касир', checkTotal: '50' }),
+      ).toBeRejectedWithError(/0\.00/);
+      await expectAsync(
+        target.createDocumentHead(id, { docType: 0, cashier: '  ' }),
+      ).toBeRejectedWithError('Не вказано касира документа.');
+      await expectAsync(
+        target.createDocumentHead(id, { docType: 100, cashier: 'Касир' }),
+      ).toBeRejectedWithError(/ShiftAlreadyOpened/);
+    });
+
+    it('generates UIDs with crypto.randomUUID by default', async () => {
+      const target = new TaxRegisterService(storage);
+      await init(target);
+
+      const head = await target.createDocumentHead(id, { docType: 0, cashier: 'Касир' });
+
+      expect(head.UID).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    });
+
+    it('builds the session end from the session start, without saving it', async () => {
+      const target = createService();
+      await init(target);
+      await expectAsync(
+        target.createOfflineSessionEnd(id, 'Касир'),
+      ).toBeRejectedWithError(/OfflineSessionNotOpened/);
+      await target.startOfflineSession(id, original);
+      const previousHash = await target.getLastDocHash(id);
+
+      const end = await target.createOfflineSessionEnd(id, 'Інший касир');
+
+      const head = headOf(end);
+      expect(head.DOCTYPE).toBe('103');
+      // Issuer of OfflineBegin, which repeats the original as written, not the TaxObject.
+      expect(head.TIN).toBe('00000042');
+      expect(head.ORGNM).toBe('ТОВ "Перший"');
+      expect(head.CASHIER).toBe('Інший касир');
+      expect(head.ORDERNUM).toBe('13');
+      expect(head.PREVDOCHASH).toBe(previousHash);
+      expect(head.ORDERTAXNUM).toBe(`77.3.${control(13, undefined, previousHash)}`);
+      expect(head.TESTING).toBeUndefined();
+      expect(await target.getDocuments(id)).toHaveSize(3);
+
+      await target.completeOfflineSession(id, end, {
+        OfflineSessionId: '78',
+        OfflineSeed: '1',
+      });
+      expect((await target.getState(id)).OfflineSession).toBeFalse();
+    });
   });
 
   describe('starting an offline session', () => {
