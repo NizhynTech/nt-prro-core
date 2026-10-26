@@ -389,9 +389,21 @@ const response = await api.sendOfflineEndPackage(endXml); // { OfflineSessionId,
 await context.completeOfflineSession(id, endXml, response);
 ```
 
-`createOfflineSessionEnd` бере дані продавця з «Початку офлайн сесії» цієї сесії, як вони там записані, тож обидва документи сесії збігаються; касира — з параметра. Документ має наступні локальний номер і номер у сесії та геш останнього документа сесії. Сесію має бути відкрито, інакше `Код помилки: 15 OfflineSessionNotOpened …`.
+`createOfflineSessionEnd` бере дані продавця з першого документа сесії («Початку офлайн сесії»), як вони там записані, тож обидва документи сесії збігаються; касира — з параметра. Документ має наступні локальний номер і номер у сесії та геш останнього документа сесії. Сесію має бути відкрито, інакше `Код помилки: 15 OfflineSessionNotOpened …`.
 
 Після цього, коли сервер має всі документи, можна знову синхронізуватися через `initContext`.
+
+## Небезпечні операції
+
+Методи з префіксом `unsafe` виконують ту саму роботу з документами, що й звичайні, але без перевірок сервісу. За коректність відповідає той, хто викликає: застосунок, який свідомо обходить правила, наприклад, щоб каса не зупинялася, коли звичайний процес заблоковано.
+
+| Метод | Що пропускає |
+| --- | --- |
+| `unsafeStartOfflineSession(id, originalXml, credentials?)` | Як `startOfflineSession`, але без жодної перевірки готовності до офлайн роботи: дозволеність офлайн режиму, відсутність відкритої сесії й ненадісланої послідовності, тривалість сесій. Передані дані сесії (`OfflineSessionId`, `OfflineSeed`) нумерують сесію й зберігаються на записі «Початку офлайн сесії», тож наступні документи сесії беруть їх; без них використовуються чинні |
+| `unsafeCreateDocumentHead(id, request)` | Як `createDocumentHead`, але без `validateNextDocument`: без перевірок документа (зміна, Z-звіт, скасована реєстрація) і лімітів офлайн сесії |
+| `unsafeReplaceDocuments(id, changes)` | Замінює або видаляє документи журналу одним записом, без перевірок нумерації, порядку, номерів у сесії, ланцюжка `PREVDOCHASH` і даних сесії. Кожна зміна називає документ його поточним XML: `replacement: null` видаляє його, інакше XML замінюється, а `offlineCredentials`, якщо передано, стають чинними з цього запису. Якщо документа немає в журналі, не застосовується жодна зміна. Черга документів для інших систем не змінюється |
+
+Для перенумерації офлайн документа є функція `renumberOfflineDocument(xml, numbering)`: вона ставить документу інші локальний номер (`orderNumber`), сесію (`sessionId`, `seed`), номер у сесії (`localNum`) і `PREVDOCHASH` (`previousDocumentHash`, з третього документа сесії) та рахує для них контрольне число. Дата, час, `UID`, тіло документа й `REVOKELASTONLINEDOC` не змінюються.
 
 ## Перевірки перед створенням документа
 
@@ -583,6 +595,7 @@ const context = new TaxRegisterService(new InMemoryTaxContextStorage(), {
 - Моделі Фіскального сервера: `TransactionsRegistrarStateResponse`, `LastShiftTotalsResponse`, `ShiftTotals`, `DocumentItem` тощо.
 - Команди Фіскального сервера та типи відповідей (див. «Команди Фіскального сервера»).
 - Пакети офлайн документів: `prepareOfflinePackage`, `readOfflinePackageResponse`, `parseOfflineSessionState`, `OfflineDocumentTooLargeError`, `MAX_OFFLINE_REQUEST_BYTES`, `MAX_OFFLINE_PACKAGE_DOCUMENTS`, `OFFLINE_PACKAGE_DOCUMENT_LIMIT`.
+- Небезпечні операції: `TaxJournalReplacement`; перенумерація: `renumberOfflineDocument`, `OfflineDocumentRenumbering`, `getDocumentCheckTotal` (сума чека у форматі `0.00` для контрольного числа).
 - `decodeBase64ToBinaryString`, `base64ByteLength`: Base64 без DOM.
 - Формування XML: `TaxDocumentUtility`, `ITaxOrder`, `ICheckPay`, `ICheckPaySys`, `ICheckTax`, `ICheckProduct`, `CHECKHEAD`, `ICheckDocument`.
 - Правила документів (див. «Правила документів»), `TaxTicket`, `DocumentIssuer`, `OfflineDocumentNumbering`, `API_MAX_OFFLINE_MONTHLY_DURATION_MINUTES`.

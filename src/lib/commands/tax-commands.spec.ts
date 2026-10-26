@@ -97,6 +97,12 @@ describe('Fiscal Server commands', () => {
       '{"Command":"ZRepExt","RegistrarNumFiscal":"4000123456",' +
         '"NumFiscal":"4000009","Type":"OriginalXml"}',
     );
+    expect(
+      new ZRepExtCommand('4000123456', null, 'OriginalXml', 15).toString(),
+    ).toBe(
+      '{"Command":"ZRepExt","RegistrarNumFiscal":"4000123456",' +
+        '"NumLocal":15,"Type":"OriginalXml"}',
+    );
   });
 
   it('Objects', () => {

@@ -15,6 +15,7 @@ import {
   getOfflineControlString,
   isPreviousDocumentHashRequired,
 } from './documents/offline-fiscal-number.js';
+import { getDocumentCheckTotal } from './documents/offline-renumber.js';
 import { CHECKHEAD } from './documents/tax-document.model.js';
 import { TaxDocumentUtility } from './documents/tax-document.utility.js';
 import {
@@ -97,6 +98,15 @@ export interface TaxJournalDocument extends DocumentItem {
 export interface TaxRegisterContextSettings extends TaxOfflineSettings {
   // Document times follow the server-time estimate instead of the device clock.
   useServerTimeCorrection: boolean;
+}
+
+// A change for unsafeReplaceDocuments: the journal document whose XML is `xml` gets the XML
+// `replacement`, or is removed when replacement is null.
+export interface TaxJournalReplacement {
+  xml: string;
+  replacement: string | null;
+  // Credentials the replaced document puts in force (see TaxJournalDocument).
+  offlineCredentials?: OfflineSessionState;
 }
 
 // Fixed settings, or a function the service calls each time it needs them, for settings that
@@ -569,8 +579,40 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
   ): Promise<string> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     await this.validateNextDocument(id, TaxDocumentType.OOFFLINE_BEGIN);
-    const state = await this.getState(id);
-    validateOfflineSessionStart(state);
+    validateOfflineSessionStart(await this.getState(id));
+    return this._startOfflineSession(id, originalXml);
+  }
+
+  // UNSAFE: startOfflineSession without any readiness check (offline work allowed, no session
+  // open, no unsent sequence, durations). The caller answers for starting a session. Given
+  // credentials number the session and are put in force on its OfflineBegin entry, so the
+  // session's next documents use them; without them, the credentials in force are used.
+  async unsafeStartOfflineSession(
+    taxRegisterId: TaxRegisterContextId,
+    originalXml: string,
+    credentials?: OfflineSessionState,
+  ): Promise<string> {
+    const id = this._normalizeTaxRegisterId(taxRegisterId);
+    return this._startOfflineSession(id, originalXml, credentials);
+  }
+
+  private async _startOfflineSession(
+    id: string,
+    originalXml: string,
+    sessionCredentials?: OfflineSessionState,
+  ): Promise<string> {
+    if (sessionCredentials) {
+      this._assertOfflineSessionState(sessionCredentials);
+    }
+    const credentials = sessionCredentials
+      ? {
+          OfflineSessionId: String(sessionCredentials.OfflineSessionId),
+          OfflineSeed: String(sessionCredentials.OfflineSeed),
+        }
+      : this._getSessionCredentials(await this.getState(id));
+    if (!credentials) {
+      throw new Error('Каса не підтримує офлайн режим.');
+    }
 
     if (!originalXml?.trim().startsWith('<')) {
       throw new Error('Tax document must be raw XML.');
@@ -600,8 +642,8 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
         orderNumber: originalNumLocal + 1,
         issuer: this._getHeadIssuer(head),
         offline: {
-          sessionId: state.OfflineSessionId,
-          seed: state.OfflineSeed,
+          sessionId: credentials.OfflineSessionId,
+          seed: credentials.OfflineSeed,
           localNum: 1,
         },
       }),
@@ -609,11 +651,11 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
 
     const copyNumLocal = originalNumLocal + 2;
     const copyFiscalNumber = createOfflineFiscalNumber(
-      state.OfflineSessionId,
+      credentials.OfflineSessionId,
       2,
       getOfflineControlNumber(
         getOfflineControlString({
-          seed: state.OfflineSeed,
+          seed: credentials.OfflineSeed,
           orderDate,
           orderTime,
           orderNumber: copyNumLocal,
@@ -632,7 +674,12 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
 
     await this._appendDocuments(id, [
       { xml: this._markRevoked(originalXml) },
-      { xml: offlineBeginXml },
+      {
+        xml: offlineBeginXml,
+        offlineCredentials: sessionCredentials
+          ? this._toOfflineCredentials(credentials)
+          : undefined,
+      },
       { xml: offlineCopyXml },
     ]);
     return offlineCopyXml;
@@ -651,6 +698,23 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
     taxRegisterId: TaxRegisterContextId,
     request: TaxDocumentHeadRequest,
   ): Promise<CHECKHEAD> {
+    return this._createDocumentHead(taxRegisterId, request, true);
+  }
+
+  // UNSAFE: createDocumentHead without validateNextDocument — no document checks (shift, Z-report,
+  // cancelled registration) and no offline session limits. The caller answers for the document.
+  async unsafeCreateDocumentHead(
+    taxRegisterId: TaxRegisterContextId,
+    request: TaxDocumentHeadRequest,
+  ): Promise<CHECKHEAD> {
+    return this._createDocumentHead(taxRegisterId, request, false);
+  }
+
+  private async _createDocumentHead(
+    taxRegisterId: TaxRegisterContextId,
+    request: TaxDocumentHeadRequest,
+    checked: boolean,
+  ): Promise<CHECKHEAD> {
     const id = this._normalizeTaxRegisterId(taxRegisterId);
     const docType = request?.docType;
     if (Number(docType) === TaxDocumentType.OOFFLINE_BEGIN) {
@@ -668,7 +732,9 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
       );
     }
 
-    await this.validateNextDocument(id, docType, request.docSubType);
+    if (checked) {
+      await this.validateNextDocument(id, docType, request.docSubType);
+    }
     const context = await this._getContext(id);
     const state = await this.getState(id);
     return this._createHead(id, state, {
@@ -685,8 +751,8 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
 
   // The end-session document (OfflineEnd) of the open session. It is not saved: send it in the
   // final package and save it with completeOfflineSession once the server accepts it. It takes
-  // the issuer data of the session's OfflineBegin, as written, so both ends of the session
-  // agree, and carries the hash of the session's last document.
+  // the issuer data of the session's first document (normally its OfflineBegin), as written, so
+  // both ends of the session agree, and carries the hash of the session's last document.
   async createOfflineSessionEnd(
     taxRegisterId: TaxRegisterContextId,
     cashier: string,
@@ -697,12 +763,10 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
     const state = await this.getState(id);
 
     const documents = await this._getDocuments(id);
-    const offlineBegin = [...documents]
-      .reverse()
-      .find((document) => document.CheckDocType === 'OfflineBegin');
-    const issuer = offlineBegin
+    const first = documents[this._getSessionIndexes(documents)[0]];
+    const issuer = first
       ? {
-          ...this._getHeadIssuer(this._getDocumentHead(offlineBegin.xmlCheck, true)),
+          ...this._getHeadIssuer(this._getDocumentHead(first.xmlCheck, true)),
           cashier: this._toCashier(cashier),
         }
       : this._getDocumentIssuer(id, context, undefined, cashier);
@@ -749,12 +813,8 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
     checkTotal?: string | null,
   ): Promise<OfflineDocumentNumbering> {
     const localNum = Number(state.OfflineNextLocalNum);
-    if (
-      !this._hasValue(state.OfflineSessionId) ||
-      !this._hasValue(state.OfflineSeed) ||
-      !Number.isInteger(localNum) ||
-      localNum < 1
-    ) {
+    const credentials = this._getSessionCredentials(state);
+    if (!credentials || !Number.isInteger(localNum) || localNum < 1) {
       throw new Error(
         'Дані офлайн сесії відсутні або некоректні: офлайн документ не створюється.',
       );
@@ -771,12 +831,25 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
     }
 
     return {
-      sessionId: String(state.OfflineSessionId),
-      seed: String(state.OfflineSeed),
+      sessionId: credentials.OfflineSessionId,
+      seed: credentials.OfflineSeed,
       localNum,
       previousDocumentHash,
       checkTotal: this._hasValue(checkTotal) ? String(checkTotal) : null,
     };
+  }
+
+  // The session credentials in force, as text, or null.
+  private _getSessionCredentials(
+    state: TaxRegisterState,
+  ): { OfflineSessionId: string; OfflineSeed: string } | null {
+    if (this._hasValue(state.OfflineSessionId) && this._hasValue(state.OfflineSeed)) {
+      return {
+        OfflineSessionId: String(state.OfflineSessionId),
+        OfflineSeed: String(state.OfflineSeed),
+      };
+    }
+    return null;
   }
 
   // Issuer of new documents: the register's TaxObject in the snapshot, overridden by the
@@ -910,18 +983,7 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
 
   // CHECKTOTAL/SUM formatted 0.00 for the control number; null for documents without one.
   private _getCheckTotal(xml: string): string | null {
-    const sum = parseXml<ParsedTaxDocument>(xml, { keepText: true }).CHECK
-      ?.CHECKTOTAL?.SUM;
-    if (!this._hasValue(sum)) {
-      return null;
-    }
-
-    const text = String(sum).trim();
-    if (/^-?\d+\.\d{2}$/.test(text)) {
-      return text;
-    }
-    const number = Number(text);
-    return Number.isFinite(number) ? number.toFixed(2) : null;
+    return getDocumentCheckTotal(xml);
   }
 
   private _text(value: unknown): string {
@@ -1436,6 +1498,68 @@ export class TaxRegisterService<TConfig extends TaxRegisterConfig = ITaxConfig> 
     );
     await this._saveDocuments(id, documents);
     return true;
+  }
+
+  // UNSAFE: replaces or removes journal documents without any check. Numbering, order, offline
+  // numbers, the hash chain and the credentials in force are the caller's responsibility. Each
+  // change names a document by its current XML; a null replacement removes it, otherwise its XML
+  // is replaced (parsed like a saved document) and offlineCredentials, when given, are put on its
+  // entry. One journal write; a change whose document is not in the journal fails it whole. The
+  // queue for other systems is not changed.
+  async unsafeReplaceDocuments(
+    taxRegisterId: TaxRegisterContextId,
+    changes: TaxJournalReplacement[],
+  ): Promise<void> {
+    const id = this._normalizeTaxRegisterId(taxRegisterId);
+    const documents = await this._getDocuments(id);
+    const updated: Array<TaxJournalDocument | null> = [...documents];
+    for (const change of changes || []) {
+      const index = documents.findIndex(
+        (document, position) =>
+          document.xmlCheck === change.xml && updated[position] === document,
+      );
+      if (index < 0) {
+        throw new Error('Tax document to replace is not in the journal.');
+      }
+      if (change.replacement === null || change.replacement === undefined) {
+        updated[index] = null;
+        continue;
+      }
+
+      const entry = this._withJournalData(
+        this._parseDocument(change.replacement),
+        documents[index],
+      );
+      if (change.offlineCredentials) {
+        this._assertOfflineSessionState(change.offlineCredentials);
+        entry.offlineCredentials = this._toOfflineCredentials(change.offlineCredentials);
+      }
+      updated[index] = entry;
+    }
+
+    await this._saveDocuments(
+      id,
+      updated.filter((document) => document !== null),
+    );
+  }
+
+  // Journal indexes of the current offline session: the offline documents after the last saved
+  // OfflineEnd.
+  private _getSessionIndexes(documents: TaxJournalDocument[]): number[] {
+    let start = 0;
+    for (let index = documents.length - 1; index >= 0; index--) {
+      if (documents[index].CheckDocType === 'OfflineEnd') {
+        start = index + 1;
+        break;
+      }
+    }
+    const session: number[] = [];
+    for (let index = start; index < documents.length; index++) {
+      if (this._getOfflineLocalNumber(documents[index].NumFiscal) !== null) {
+        session.push(index);
+      }
+    }
+    return session;
   }
 
   private async _getContext(

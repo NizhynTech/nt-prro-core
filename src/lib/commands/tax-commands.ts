@@ -229,6 +229,7 @@ export class CheckExtCommand {
 }
 
 // Запит Z-звіту.
+// The Z-report is identified by its fiscal number or, with numFiscal null, by its local number.
 export class ZRepExtCommand {
   readonly Command = 'ZRepExt';
 
@@ -236,13 +237,15 @@ export class ZRepExtCommand {
     private _registrarNumFiscal: string,
     private _numFiscal: string,
     private _type: TaxDocumentResponseType,
+    private _numLocal?: number,
   ) {}
 
   toString(): string {
     return JSON.stringify({
       Command: this.Command,
       RegistrarNumFiscal: this._registrarNumFiscal,
-      NumFiscal: this._numFiscal,
+      NumFiscal: this._numFiscal ?? undefined,
+      NumLocal: this._numLocal,
       Type: this._type,
     });
   }

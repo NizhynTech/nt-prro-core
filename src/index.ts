@@ -7,6 +7,7 @@ export * from './lib/documents/document-date.js';
 export * from './lib/documents/document-hash.js';
 export * from './lib/documents/document-head.js';
 export * from './lib/documents/offline-fiscal-number.js';
+export * from './lib/documents/offline-renumber.js';
 export * from './lib/documents/tax-document.model.js';
 export * from './lib/documents/tax-document.utility.js';
 export * from './lib/documents/tax-ticket.js';

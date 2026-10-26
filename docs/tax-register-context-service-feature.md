@@ -810,6 +810,16 @@ For example, an unsaved end draft has `NumLocal = 20`. Receiving `endState: Offl
 
 > Edge-case comment: when the server accepted the end but its successful response was lost, the server can be one global number ahead of the local journal. A simple equality check can therefore miss successful closure. The precise recovery comparison is intentionally left unresolved; this comment does not approve a new comparison rule or permit saving the end without a successful response.
 
+## Unchecked operations
+
+An application may need to keep working when the rules above would stop it, for example to keep a point of sale running while a register's state is broken, and to repair the documents later. For that, the service may offer unchecked variants of a few operations. They do the same document work without the service's checks, and the caller takes over responsibility for what those checks protect. With them, the guarantees of this specification no longer hold for the documents involved.
+
+- **Start an offline session without readiness checks.** No check that offline work is allowed, that no session is open, that no earlier sequence is unsent, or of the durations. The caller may supply the session credentials. They are saved on the `OfflineBegin` entry as the credentials in force, so the session's later documents use them.
+- **Build a document header without the document checks.** No shift, Z-report or cancelled-registration checks, and no offline session limits.
+- **Replace or remove journal entries.** One commit, with no checks of numbering, order, offline numbers, the hash chain or credentials. A replaced entry can carry the credentials it puts in force.
+
+Renumbering an offline document (new global number, session, offline number and previous-document hash, with a new control number; date, time, `UID` and body unchanged) is a pure document rule that such repairs can use.
+
 ## Core and its ports
 
 The flow is implemented as a core plus a small set of ports. The core contains every decision in this document: the lifecycle state machine, numbering, offline document construction, the revocation decision, package selection and packing, response normalization, reconciliation, and the totals fold. Given the same inputs, it makes the same decisions. All input and output go through the ports below, so the core can be tested with fakes and has no direct access to the network, the signer, the clock, or storage. Every port call carries the target `NumFiscal`; no port holds a "current register".

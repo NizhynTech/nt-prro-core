@@ -19,6 +19,7 @@ import {
   getOfflineControlNumber,
   getOfflineControlString,
 } from './documents/offline-fiscal-number.js';
+import { renumberOfflineDocument } from './documents/offline-renumber.js';
 import { parseXml } from './utils/xml-parser.js';
 
 describe('TaxRegisterService', () => {
@@ -1054,6 +1055,200 @@ describe('TaxRegisterService', () => {
         OfflineSeed: '1',
       });
       expect((await target.getState(id)).OfflineSession).toBeFalse();
+    });
+  });
+
+  describe('unsafe operations', () => {
+    const id = '4000002411';
+    const seed = '179625192271939';
+    const body = '<CHECKTOTAL><SUM>100.00</SUM></CHECKTOTAL>';
+    // A sale sent online at 10 that got no answer.
+    const original =
+      '<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><UID>u-1</UID><TIN>01234567</TIN>' +
+      '<ORGNM>ТОВ</ORGNM><POINTNM>Кафе</POINTNM><ORDERDATE>30092026</ORDERDATE>' +
+      '<ORDERTIME>235959</ORDERTIME><ORDERNUM>10</ORDERNUM><CASHDESKNUM>19</CASHDESKNUM>' +
+      '<CASHREGISTERNUM>4000002411</CASHREGISTERNUM><CASHIER>Касир</CASHIER><VER>1</VER>' +
+      `</CHECKHEAD>${body}</CHECK>`;
+    const sale = (numLocal: number, uid: string, fiscalNumber: string) =>
+      `<CHECK><CHECKHEAD><DOCTYPE>0</DOCTYPE><DOCSUBTYPE>0</DOCSUBTYPE><UID>${uid}</UID>` +
+      '<TIN>01234567</TIN><ORGNM>ТОВ</ORGNM><POINTNM>Кафе</POINTNM>' +
+      `<ORDERDATE>01102026</ORDERDATE><ORDERTIME>093010</ORDERTIME><ORDERNUM>${numLocal}</ORDERNUM>` +
+      '<CASHDESKNUM>19</CASHDESKNUM><CASHREGISTERNUM>4000002411</CASHREGISTERNUM>' +
+      `<CASHIER>Касир</CASHIER><VER>1</VER><ORDERTAXNUM>${fiscalNumber}</ORDERTAXNUM>` +
+      '<OFFLINE>true</OFFLINE></CHECKHEAD><CHECKTOTAL><SUM>50.00</SUM></CHECKTOTAL></CHECK>';
+    // No credentials, an earlier sequence the server has not finished, offline not supported.
+    const noCredentials = {
+      ...registerState,
+      OfflineSupported: false,
+      OfflineSessionId: null,
+      OfflineSeed: null,
+      OfflineNextLocalNum: '3',
+    } as TransactionsRegistrarStateResponse;
+    const placeholder = { OfflineSessionId: '0', OfflineSeed: '0' };
+    const control = (
+      orderNumber: number,
+      orderTime: string,
+      checkTotal?: string,
+      previousDocumentHash?: string,
+      controlSeed = seed,
+    ) =>
+      getOfflineControlNumber(
+        getOfflineControlString({
+          seed: controlSeed,
+          orderDate: '01102026',
+          orderTime,
+          orderNumber,
+          cashRegisterNum: id,
+          cashDeskNum: 19,
+          checkTotal,
+          previousDocumentHash,
+        }),
+      );
+    const headOf = (xml: string) =>
+      parseXml<{ CHECK: { CHECKHEAD: Record<string, string> } }>(xml, {
+        keepText: true,
+      }).CHECK.CHECKHEAD;
+    const init = (target: TaxRegisterService) =>
+      target.initContext(createConfig(id), noCredentials, openedShiftTotals, serverState);
+
+    beforeEach(() => {
+      jasmine.clock().install();
+      jasmine.clock().mockDate(new Date(2026, 9, 1, 9, 30, 5));
+    });
+
+    afterEach(() => jasmine.clock().uninstall());
+
+    it('starts an offline session without the readiness checks, with the given credentials', async () => {
+      const target = new TaxRegisterService(storage, { offlineEnabled: false });
+      await init(target);
+      await expectAsync(target.startOfflineSession(id, original)).toBeRejected();
+      await expectAsync(target.unsafeStartOfflineSession(id, original)).toBeRejectedWithError(
+        'Каса не підтримує офлайн режим.',
+      );
+
+      await target.unsafeStartOfflineSession(id, original, placeholder);
+
+      const [revoked, begin, copy] = await target.getDocuments(id);
+      expect(revoked.Revoked).toBeTrue();
+      expect(begin.NumFiscal).toBe(`0.1.${control(11, '093005', undefined, undefined, '0')}`);
+      expect(begin.offlineCredentials).toEqual(placeholder);
+      expect(copy.NumFiscal).toBe(`0.2.${control(12, '093005', '100.00', undefined, '0')}`);
+      // The session's next documents use them.
+      const state = await target.getState(id);
+      expect(state.OfflineSessionId).toBe('0');
+      expect(state.OfflineNextLocalNum).toBe('3');
+    });
+
+    it('builds a header without the document checks and offline limits', async () => {
+      const target = new TaxRegisterService(
+        storage,
+        { maxOfflineDocuments: 2 },
+        { createUid: () => 'uid-new' },
+      );
+      await init(target);
+      await target.unsafeStartOfflineSession(id, original, placeholder);
+      const request = {
+        docType: 0,
+        cashier: 'Касир',
+        issuer: { tin: '01234567', organizationName: 'ТОВ', pointName: 'Кафе', cashDeskNum: 19 },
+      };
+
+      await expectAsync(target.createDocumentHead(id, request)).toBeRejectedWithError(
+        /максимальну кількість документів/,
+      );
+      const head = await target.unsafeCreateDocumentHead(id, request);
+
+      expect(head.ORDERNUM).toBe(13);
+      expect(head.ORDERTAXNUM).toMatch(/^0\.3\.\d+$/);
+      expect(head.PREVDOCHASH).toBe(await target.getLastDocHash(id));
+    });
+
+    it('replaces and removes journal documents without checks, in one write', async () => {
+      const target = new TaxRegisterService(storage);
+      await init(target);
+      await target.unsafeStartOfflineSession(id, original, placeholder);
+      await target.saveDocument(id, sale(13, 'sale-1', '0.3.1'));
+      const [revoked, begin, copy, first] = await target.getDocuments(id);
+      const renumbered = renumberOfflineDocument(copy.xmlCheck, {
+        orderNumber: 11,
+        sessionId: '77',
+        seed,
+        localNum: 2,
+      });
+      storage.set.calls.reset();
+
+      await target.unsafeReplaceDocuments(id, [
+        { xml: begin.xmlCheck, replacement: null },
+        {
+          xml: copy.xmlCheck,
+          replacement: renumbered,
+          offlineCredentials: { OfflineSessionId: '77', OfflineSeed: seed },
+        },
+      ]);
+
+      expect(storage.set).toHaveBeenCalledTimes(1);
+      const documents = await target.getDocuments(id);
+      expect(documents.map((item) => item.xmlCheck)).toEqual([
+        revoked.xmlCheck,
+        renumbered,
+        first.xmlCheck,
+      ]);
+      expect(documents[1].NumLocal).toBe(11);
+      expect(documents[1].offlineCredentials).toEqual({
+        OfflineSessionId: '77',
+        OfflineSeed: seed,
+      });
+      await expectAsync(
+        target.unsafeReplaceDocuments(id, [{ xml: begin.xmlCheck, replacement: null }]),
+      ).toBeRejectedWithError('Tax document to replace is not in the journal.');
+
+      // Without its own start, the session end takes the issuer of the session's first document.
+      const end = await target.createOfflineSessionEnd(id, 'Касир');
+      expect(headOf(end).TIN).toBe('01234567');
+      expect(headOf(end).ORDERTAXNUM).toMatch(/^77\.4\.\d+$/);
+    });
+
+    it('renumbers an offline document', () => {
+      const hash = 'ab'.repeat(32);
+      const xml = sale(13, 'sale-1', '0.3.1').replace(
+        '<OFFLINE>true</OFFLINE>',
+        '<OFFLINE>true</OFFLINE><PREVDOCHASH>old</PREVDOCHASH>',
+      );
+
+      const renumbered = renumberOfflineDocument(xml, {
+        orderNumber: 12,
+        sessionId: '77',
+        seed,
+        localNum: 3,
+        previousDocumentHash: hash,
+      });
+
+      expect(headOf(renumbered).ORDERNUM).toBe('12');
+      expect(headOf(renumbered).PREVDOCHASH).toBe(hash);
+      expect(headOf(renumbered).ORDERTAXNUM).toBe(
+        `77.3.${control(12, '093010', '50.00', hash)}`,
+      );
+      expect(renumbered.split('</CHECKHEAD>')[1]).toBe(xml.split('</CHECKHEAD>')[1]);
+      expect(() =>
+        renumberOfflineDocument(xml, { orderNumber: 12, sessionId: '77', seed, localNum: 3 }),
+      ).toThrowError(/PREVDOCHASH/);
+
+      const begin =
+        '<CHECK><CHECKHEAD><DOCTYPE>102</DOCTYPE><UID>u-1</UID><ORDERDATE>01102026</ORDERDATE>' +
+        '<ORDERTIME>093005</ORDERTIME><ORDERNUM>11</ORDERNUM><CASHDESKNUM>19</CASHDESKNUM>' +
+        '<CASHREGISTERNUM>4000002411</CASHREGISTERNUM>' +
+        '<REVOKELASTONLINEDOC>true</REVOKELASTONLINEDOC><CASHIER>Касир</CASHIER><VER>1</VER>' +
+        '<ORDERTAXNUM>0.1.5</ORDERTAXNUM><OFFLINE>true</OFFLINE></CHECKHEAD></CHECK>';
+      const renumberedBegin = renumberOfflineDocument(begin, {
+        orderNumber: 10,
+        sessionId: '77',
+        seed,
+        localNum: 1,
+      });
+      expect(renumberedBegin).toContain('<REVOKELASTONLINEDOC>true</REVOKELASTONLINEDOC>');
+      expect(renumberedBegin).toContain(
+        `<VER>1</VER><ORDERTAXNUM>77.1.${control(10, '093005')}</ORDERTAXNUM><OFFLINE>true</OFFLINE></CHECKHEAD>`,
+      );
     });
   });
 
