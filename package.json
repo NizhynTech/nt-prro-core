@@ -1,6 +1,6 @@
 {
   "name": "tax-register-core",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Local state of Ukrainian software cash registers (PRRO): context, document journal, offline session rules and shift totals. Plain TypeScript, no framework dependencies.",
   "type": "module",
   "main": "./dist/index.js",
